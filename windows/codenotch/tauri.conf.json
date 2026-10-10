@@ -46,7 +46,7 @@
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://github.com/vinzdg/codenotch/releases/latest/download/latest.json"
+        "https://github.com/carlosbezerralopes/codenotch/releases/latest/download/latest.json"
       ],
       "pubkey": "REPLACE_WITH_TAURI_PUBLIC_KEY",
       "windows": {

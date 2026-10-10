@@ -17,6 +17,10 @@ The SVG files in this directory come from the npm package `@lobehub/icons-static
 
 MIT License — Copyright (c) LobeHub. See that repository's LICENSE.
 
+**Kiro**: `kiro.svg` converts the three existing vector loops from upstream
+`Sources/Providers/GlyphOutline.swift` (`kiro`), under this repository's MIT license.
+The Kiro mark remains AWS's trademark; no new logo was drawn.
+
 **Trademarks**: these marks are trademarks of Anthropic, OpenAI, Anysphere (Cursor), xAI (Grok), GitHub
 (Copilot), Google and the OpenCode project respectively, and are used here only to identify the product whose usage is displayed. Whether
 they stay in a distributed build is the repository owner's call under each brand's guidelines;

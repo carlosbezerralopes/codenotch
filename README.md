@@ -1,3 +1,7 @@
+> **Fork Windows:** este fork adiciona o suporte ao Kiro na versão Windows.
+> Consulte [FORK.md](FORK.md) e [windows/README.md](windows/README.md) para
+> pré-requisitos, build e atualizações. A documentação upstream segue abaixo.
+
 <div align="center">
 
 ![Codenotch](docs/design/codenotch-banner.png)

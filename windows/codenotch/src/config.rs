@@ -110,6 +110,9 @@ pub struct Config {
     /// The same one-shot migration for the GitHub Copilot ring.
     #[serde(default)]
     pub copilot_notch_fixed: bool,
+    /// Add Kiro once to selections saved before this adapter existed.
+    #[serde(default)]
+    pub kiro_notch_fixed: bool,
     /// false = the pill is kept off the screen edge entirely; the tray icon is then the only way in
     #[serde(default = "yes")]
     pub notch_visible: bool,
@@ -303,6 +306,7 @@ impl Default for Config {
             glm_notch_fixed: true, // a fresh install picks from the full list already
             opencode_notch_fixed: true,
             copilot_notch_fixed: true,
+            kiro_notch_fixed: true,
             notch_visible: true,
             notch_on_hover: true,
             tray_visible: true,
@@ -346,6 +350,7 @@ pub fn load() -> Config {
     migrate_opencode_notch(&mut cfg, &raw);
     // And for GitHub Copilot.
     migrate_copilot_notch(&mut cfg, &raw);
+    migrate_kiro_notch(&mut cfg, &raw);
 
     // Both hidden would leave the app unreachable: no pill, no tray icon, no way to open settings.
     if !cfg.notch_visible && !cfg.tray_visible {
@@ -409,6 +414,16 @@ fn migrate_copilot_notch(cfg: &mut Config, raw: &Option<String>) {
     cfg.copilot_notch_fixed = true;
 }
 
+fn migrate_kiro_notch(cfg: &mut Config, raw: &Option<String>) {
+    let predates = raw.as_deref().and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+        .map(|v| v.get("kiro_notch_fixed").is_none()).unwrap_or(false);
+    if !predates { return; }
+    if !cfg.notch_slots.is_empty() && !cfg.notch_slots.iter().any(|s| s.provider == "kiro") {
+        cfg.notch_slots.push(TraySlot { provider: "kiro".into() });
+    }
+    cfg.kiro_notch_fixed = true;
+}
+
 pub fn save(cfg: &Config) {
     let path = config_path();
     if let Some(dir) = path.parent() {
@@ -421,6 +436,19 @@ pub fn save(cfg: &Config) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn kiro_migration_is_once_and_preserves_explicit_order_and_hide() {
+        let mut cfg = super::Config::default();
+        cfg.notch_slots = vec![super::TraySlot { provider: "codex".into() }];
+        super::migrate_kiro_notch(&mut cfg, &Some("{}".into()));
+        assert_eq!(cfg.notch_slots.iter().map(|s| s.provider.as_str()).collect::<Vec<_>>(), ["codex", "kiro"]);
+        cfg.notch_slots.pop();
+        super::migrate_kiro_notch(&mut cfg, &Some("{\"kiro_notch_fixed\":true}".into()));
+        assert_eq!(cfg.notch_slots.len(), 1);
+        let mut fresh = super::Config::default();
+        super::migrate_kiro_notch(&mut fresh, &None);
+        assert!(fresh.notch_slots.is_empty());
+    }
     use super::{
         carry_shared_position, clamp_critical_limit, clamp_watch_limit, color_transition_or_step,
         keep_open_on_upgrade, snap_scale, theme_or_system, weekly_ring_or_off, Config,

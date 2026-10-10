@@ -21,8 +21,40 @@ documented behaviour and the wire formats.
 | **OpenCode** | OpenCode's own sign-in, read only: the `opencode-go` key in `~/.local/share/opencode/auth.json` → `opencode.ai/zen/go/v1/usage`, or — since OpenCode 1.18 — the OAuth sign-in in `opencode.db` (`credential` table) → `opencode.ai/inference/go/v1/usage` | The Go plan's 5-hour, weekly and monthly windows. A sign-in without a Go plan shows "No OpenCode Go subscription" instead of a ring; Zen pay-as-you-go credit has no balance or usage API, so it is not shown. |
 | **Antigravity** | Official `agy` CLI `/usage` print when installed; otherwise the existing local `language_server` bridge, Google Cloud Code API, or transcript model count | Official four quota rows (Gemini & Claude/GPT 5h/weekly) without running the full IDE. When CLI is absent, falls back to legacy local bridge/API. |
 | **OpenCode Go** | `GET https://opencode.ai/zen/go/v1/usage` | Reads the `opencode-go` key in OpenCode's `auth.json`, or `OPENCODE_APIKEY` when set. The environment key takes precedence. Shows rolling 5-hour, weekly and monthly usage. This is a separate subscription from the Z.ai GLM Coding Plan; its key must not be sent to Z.ai's monitor endpoint. |
+| **Kiro** | The native `kiro-cli.exe` session, via `chat --no-interactive /usage`; optional read-only SQLite `GetUsageLimits` enrichment | Monthly credits on the ring; bonus wallet and metered overage on the hover card. No weekly ring is invented. |
 
 Providers that are not installed simply do not get a cell.
+
+### Kiro
+
+Install the [native Windows CLI](https://kiro.dev/docs/getting-started/installation/)
+and sign in with `kiro-cli login`. The official MSI installer names
+`%ProgramFiles%\Kiro-Cli` as its destination. Discovery also checks native
+home/local install candidates and absolute PATH entries. `KIRO_CLI_PATH` can
+name an absolute `.exe`; an invalid override stops discovery rather than
+running a different executable. `.cmd`, relative PATH entries, WSL and
+IDE-only credentials are not used.
+
+The hidden process receives only `/usage`, with classic UI, null stdin and
+a 20-second timeout. Its Windows JobObject is assigned before it resumes,
+and all children are terminated after completion or timeout. Both output
+streams are drained concurrently, with 64 KiB of retained text each. The
+CLI owns authentication and may perform its normal session refresh; Codenotch
+never writes its credentials. Reads run at startup, every five minutes and
+on explicit refresh. Switching off its ring uses the existing display setting.
+
+Optional enrichment reads `KIRO_DATA_DIR/data.sqlite3` when that absolute
+directory is set; otherwise it checks existing native `kiro-cli` databases
+under LocalAppData/AppData. These fallback locations are discovery candidates,
+not a guarantee about every CLI version. The borrowed profile ARN selects
+only the upstream US East/Frankfurt service endpoints. API failures retain
+the CLI reading; HTTP 429 backs off enrichment alone. Plan-only CLI output
+shows no percentage, sign-out requests CLI login, and removing the CLI removes
+its cell even if a saved reading exists. Kiro activity/session detection is
+not provided by this adapter.
+
+Run `cargo test --locked` and `node --test test-kiro.cjs` from `windows/`.
+The regression fixtures do not use account credentials or inference.
 
 ### Codex quota recovery
 
@@ -66,7 +98,7 @@ it prints no account credentials or quota values and is not run by CI.
 ### Reset cards
 
 The Windows app can show a short card when any active provider — Claude,
-Codex, Cursor, GLM, OpenCode, Grok, Antigravity — renews a quota window it was
+Codex, Cursor, GLM, OpenCode, Grok, Antigravity, Kiro — renews a quota window it was
 using. Each provider's own windows are watched independently and by their own
 id, not by a fixed duration, so this needs no per-provider list to stay
 current. Each window needs at least 10% usage before its reset counts, and a
@@ -116,7 +148,8 @@ shows an error or the last reading marked stale. Codenotch does not automate sig
 
 ## Install / build
 
-Download [`Codenotch-Setup.exe`](https://github.com/vinzdg/codenotch/releases/latest/download/Codenotch-Setup.exe)
+The fork has no published release yet; use the Windows CI build until its first release.
+Once published, download [`Codenotch-Setup.exe`](https://github.com/carlosbezerralopes/codenotch/releases/latest/download/Codenotch-Setup.exe)
 from the latest release. It installs for the current user without administrator rights, puts
 `codenotch-hook.exe` beside the app where **Install hooks** looks for it, and fetches WebView2 if
 Windows does not already have it. The installer is not code-signed, so SmartScreen stops it the

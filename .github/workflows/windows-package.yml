@@ -22,9 +22,7 @@ on:
 
 jobs:
   package:
-    # workflow_dispatch is let through so a fork can try the installer before
-    # opening a pull request; every other trigger only runs here.
-    if: github.repository == 'vinzdg/codenotch' || github.event_name == 'workflow_dispatch'
+    if: github.repository == 'carlosbezerralopes/codenotch' || github.event_name == 'workflow_dispatch'
     name: NSIS installer
     # Only the release step writes anything; `gh release upload` fails without it.
     permissions:
@@ -164,7 +162,7 @@ jobs:
             platforms = [ordered]@{
               'windows-x86_64' = [ordered]@{
                 signature = $signature
-                url = "https://github.com/vinzdg/codenotch/releases/download/v$version/Codenotch-Setup.nsis.zip"
+                url = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/v$version/Codenotch-Setup.nsis.zip"
               }
             }
           }

@@ -1,0 +1,636 @@
+//! Kiro CLI /usage is authoritative; GetUsageLimits only enriches its credit ceilings.
+//! Borrowed SQLite authentication is read-only and never refreshed by Codenotch.
+use crate::usage::{LimitWindow, UsageSnapshot};
+use crate::AppState;
+use chrono::{Datelike, Local, NaiveDate, TimeZone};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tauri::{AppHandle, Emitter, Manager};
+
+const ARGS: [&str; 3] = ["chat", "--no-interactive", "/usage"];
+const OUTPUT_LIMIT: usize = 64 * 1024;
+static REFRESH: AtomicBool = AtomicBool::new(false);
+
+pub fn request_refresh() { REFRESH.store(true, Ordering::Relaxed); }
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+fn store_path() -> PathBuf { crate::config::config_path().with_file_name("kiro-usage.json") }
+fn absent() -> UsageSnapshot { UsageSnapshot { status: "absent".into(), ..Default::default() } }
+
+fn runnable(path: &Path) -> bool {
+    path.is_absolute() && path.is_file()
+        && path.extension().and_then(|s| s.to_str()).is_some_and(|s| s.eq_ignore_ascii_case("exe"))
+}
+
+/// Explicit invalid overrides stop discovery; relative PATH entries and shell shims are refused.
+fn locate(override_path: Option<&str>, candidates: &[PathBuf], path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    if let Some(raw) = override_path.filter(|s| !s.trim().is_empty()) {
+        let p = PathBuf::from(raw.trim());
+        return runnable(&p).then_some(p);
+    }
+    candidates.iter().cloned().chain(path.into_iter().flat_map(std::env::split_paths)
+        .filter(|p| p.is_absolute()).map(|p| p.join("kiro-cli.exe")))
+        .find(|p| runnable(p))
+}
+
+pub fn find_cli() -> Option<PathBuf> {
+    // This adapter deliberately does not claim an IDE or WSL session.
+    #[cfg(not(windows))]
+    { None }
+    #[cfg(windows)]
+    {
+        let mut candidates = Vec::new();
+        // cli.kiro.dev/install.ps1 installs the MSI in Program Files/Kiro-Cli.
+        if let Some(p) = std::env::var_os("ProgramFiles") {
+            candidates.push(PathBuf::from(p).join("Kiro-Cli/kiro-cli.exe"));
+        }
+        if let Some(h) = dirs::home_dir() {
+            candidates.push(h.join(".local/bin/kiro-cli.exe"));
+            candidates.push(h.join(".kiro/bin/kiro-cli.exe"));
+        }
+        if let Some(p) = std::env::var_os("LOCALAPPDATA") {
+            candidates.push(PathBuf::from(p).join("kiro-cli/bin/kiro-cli.exe"));
+        }
+        locate(std::env::var("KIRO_CLI_PATH").ok().as_deref(), &candidates, std::env::var_os("PATH").as_deref())
+    }
+}
+
+pub fn load_persisted() -> UsageSnapshot {
+    if find_cli().is_none() { return absent(); }
+    std::fs::read_to_string(store_path()).ok()
+        .and_then(|s| serde_json::from_str::<UsageSnapshot>(&s).ok())
+        .map(|mut s| { if !s.windows.is_empty() { s.status = "stale".into(); } s })
+        .unwrap_or_default()
+}
+
+#[derive(Debug, PartialEq)]
+enum ReadError { NeedsAuth, TimedOut, BadOutput, Process }
+
+fn usage_text(stdout: &str, stderr: &str) -> Option<String> {
+    let text = if stdout.contains("Estimated Usage") { stdout }
+        else if stderr.contains("Estimated Usage") { stderr }
+        else if !stdout.trim().is_empty() { stdout } else { stderr };
+    (!text.trim().is_empty()).then(|| text.to_string())
+}
+
+fn strip_ansi(text: &str) -> String {
+    let mut chars = text.chars().peekable();
+    let mut out = String::new();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' { out.push(c); continue; }
+        match chars.next() {
+            Some('[') => { for x in chars.by_ref() { if ('@'..='~').contains(&x) { break; } } }
+            Some(']') => {
+                while let Some(x) = chars.next() {
+                    if x == '\x07' { break; }
+                    if x == '\x1b' && chars.peek() == Some(&'\\') { chars.next(); break; }
+                }
+            }
+            Some('(' | ')') => { chars.next(); }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn number_prefix(s: &str) -> Option<f64> {
+    let raw: String = s.trim_start().chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+    raw.parse::<f64>().ok().filter(|n| n.is_finite() && *n >= 0.0)
+}
+fn pair(s: &str, separator: &str) -> Option<(f64, f64)> {
+    let (a, b) = s.split_once(separator)?;
+    Some((number_prefix(a)?, number_prefix(b)?))
+}
+fn display_plan(raw: &str) -> String {
+    let s = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !s.to_ascii_lowercase().contains("kiro") { return s; }
+    s.split_whitespace().map(|w| {
+        let mut c = w.chars();
+        c.next().map(|h| format!("{}{}", h.to_uppercase(), c.as_str().to_ascii_lowercase())).unwrap_or_default()
+    }).collect::<Vec<_>>().join(" ")
+}
+
+fn reset_stamp(raw: &str, now: chrono::DateTime<Local>) -> Option<u64> {
+    let stamp = raw.split_whitespace().next()?;
+    let date = if stamp.contains('-') {
+        NaiveDate::parse_from_str(stamp, "%Y-%m-%d").ok()?
+    } else {
+        let (m, d) = stamp.split_once('/')?;
+        let make = |year| NaiveDate::from_ymd_opt(year, m.parse().ok()?, d.parse().ok()?);
+        let date = make(now.year())?;
+        if date >= now.date_naive() { date } else { make(now.year() + 1)? }
+    };
+    Local.from_local_datetime(&date.and_hms_opt(0, 0, 0)?).earliest()
+        .map(|d| d.timestamp_millis().max(0) as u64)
+}
+
+#[derive(Debug)]
+struct Reading { plan: Option<String>, windows: Vec<LimitWindow> }
+
+fn parse_cli(text: &str, now: chrono::DateTime<Local>) -> Result<Reading, ReadError> {
+    let clean = strip_ansi(text);
+    let lower = clean.to_ascii_lowercase();
+    if ["not logged in", "login required", "failed to initialize auth portal", "kiro-cli login", "oauth error"]
+        .iter().any(|s| lower.contains(s)) { return Err(ReadError::NeedsAuth); }
+    let plan = clean.lines().find_map(|line| {
+        if let Some((_, tail)) = line.split_once("Plan:") {
+            return tail.split('|').next().map(str::trim).filter(|s| !s.is_empty()).map(display_plan);
+        }
+        let parts: Vec<_> = line.split('|').map(str::trim).collect();
+        if line.contains("Estimated Usage") && parts.len() >= 3 && !parts[2].is_empty() {
+            return Some(display_plan(parts[2]));
+        }
+        parts.iter().find(|p| p.starts_with("KIRO ")).map(|p| display_plan(p))
+    });
+    let percent = clean.lines().find_map(|line| {
+        let start = line.find('█')?;
+        let tail = line[start..].trim_start_matches('█').trim_start();
+        let (n, _) = tail.split_once('%')?;
+        n.trim().parse::<f64>().ok().filter(|n| n.is_finite() && *n >= 0.0).map(|n| n / 100.0)
+    });
+    let credits = clean.split('(').skip(1).find_map(|s| {
+        if !s.split(')').next().unwrap_or("").contains("covered") { return None; }
+        pair(s, " of ")
+    });
+    let resets_at = clean.split_once("resets on ").and_then(|(_, s)| reset_stamp(s, now));
+    let mut windows = Vec::new();
+    if let Some(used) = percent.or_else(|| credits.filter(|(_, total)| *total > 0.0).map(|(used, total)| used / total)) {
+        windows.push(LimitWindow { id: "credits".into(), label: "Credits".into(), used, resets_at, ..Default::default() });
+    }
+    let bonus = clean.split_once("Bonus credits:").and_then(|(_, s)| pair(s, "/"));
+    if let Some((used, total)) = bonus.filter(|(_, total)| *total > 0.0) {
+        let expiry = clean.split_once("expires in ").and_then(|(_, s)| number_prefix(s))
+            .filter(|n| *n <= 36500.0)
+            .and_then(|n| now.checked_add_days(chrono::Days::new(n as u64)))
+            .map(|d| d.timestamp_millis().max(0) as u64);
+        windows.push(LimitWindow { id: "bonus".into(), label: "Credits".into(), group: Some("Bonus".into()), used: used / total, resets_at: expiry, ..Default::default() });
+    }
+    if plan.is_none() && windows.is_empty() { return Err(ReadError::BadOutput); }
+    Ok(Reading { plan, windows })
+}
+
+/// Quote for CreateProcessW; no shell ever interprets these arguments.
+#[cfg(windows)]
+fn quote_arg(arg: &str) -> String {
+    let mut out = String::from("\"");
+    let mut slashes = 0;
+    for c in arg.chars() {
+        if c == '\\' { slashes += 1; continue; }
+        out.extend(std::iter::repeat('\\').take(if c == '"' { slashes * 2 + 1 } else { slashes }));
+        slashes = 0;
+        out.push(c);
+    }
+    out.extend(std::iter::repeat('\\').take(slashes * 2));
+    out.push('"');
+    out
+}
+
+#[cfg(windows)]
+fn run_process(program: &Path, args: &[&str], cwd: &Path, timeout: Duration) -> Result<String, ReadError> {
+    use std::io::Read;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use windows::core::{PCWSTR, PWSTR};
+    use windows::Win32::Foundation::{CloseHandle, DuplicateHandle, HANDLE, DUPLICATE_SAME_ACCESS, WAIT_OBJECT_0};
+    use windows::Win32::System::JobObjects::*;
+    use windows::Win32::System::Pipes::CreatePipe;
+    use windows::Win32::System::Threading::*;
+    struct Handle(HANDLE);
+    impl Drop for Handle { fn drop(&mut self) { unsafe { let _ = CloseHandle(self.0); } } }
+    let fail = |_| ReadError::Process;
+    let job = Handle(unsafe { CreateJobObjectW(None, PCWSTR::null()) }.map_err(fail)?);
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    unsafe { SetInformationJobObject(job.0, JobObjectExtendedLimitInformation, &limits as *const _ as _, std::mem::size_of_val(&limits) as u32) }.map_err(fail)?;
+    let inherit = |h: HANDLE| -> Result<Handle, ReadError> {
+        let mut dup = HANDLE::default();
+        unsafe { DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), &mut dup, 0, true, DUPLICATE_SAME_ACCESS) }.map_err(fail)?;
+        Ok(Handle(dup))
+    };
+    let pipe = || -> Result<(std::fs::File, Handle), ReadError> {
+        let mut r = HANDLE::default(); let mut w = HANDLE::default();
+        unsafe { CreatePipe(&mut r, &mut w, None, 0) }.map_err(fail)?;
+        let reader = unsafe { std::fs::File::from_raw_handle(r.0 as _) };
+        let writer = Handle(w);
+        Ok((reader, inherit(writer.0)?))
+    };
+    let (stdout, out_write) = pipe()?;
+    let (stderr, err_write) = pipe()?;
+    let null = std::fs::File::open("NUL").map_err(|_| ReadError::Process)?;
+    let input = inherit(HANDLE(null.as_raw_handle() as _))?;
+    let inherited = [input.0, out_write.0, err_write.0];
+    let mut attr_size = 0;
+    unsafe { let _ = InitializeProcThreadAttributeList(LPPROC_THREAD_ATTRIBUTE_LIST(std::ptr::null_mut()), 1, 0, &mut attr_size); }
+    let mut storage = vec![0usize; attr_size.div_ceil(std::mem::size_of::<usize>())];
+    let attr = LPPROC_THREAD_ATTRIBUTE_LIST(storage.as_mut_ptr() as _);
+    unsafe { InitializeProcThreadAttributeList(attr, 1, 0, &mut attr_size) }.map_err(fail)?;
+    struct Attr(LPPROC_THREAD_ATTRIBUTE_LIST);
+    impl Drop for Attr { fn drop(&mut self) { unsafe { DeleteProcThreadAttributeList(self.0); } } }
+    let _attr_guard = Attr(attr);
+    unsafe { UpdateProcThreadAttribute(attr, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize, Some(inherited.as_ptr() as _), std::mem::size_of_val(&inherited), None, None) }.map_err(fail)?;
+    let mut si = STARTUPINFOEXW::default();
+    si.StartupInfo.cb = std::mem::size_of_val(&si) as u32;
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdInput = input.0;
+    si.StartupInfo.hStdOutput = out_write.0;
+    si.StartupInfo.hStdError = err_write.0;
+    si.lpAttributeList = attr;
+    let program_w: Vec<u16> = program.as_os_str().encode_wide().chain(Some(0)).collect();
+    let cwd_w: Vec<u16> = cwd.as_os_str().encode_wide().chain(Some(0)).collect();
+    let command = std::iter::once(quote_arg(&program.to_string_lossy())).chain(args.iter().map(|s| quote_arg(s))).collect::<Vec<_>>().join(" ");
+    let mut command_w: Vec<u16> = command.encode_utf16().chain(Some(0)).collect();
+    let mut environment: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os()
+        .filter(|(k, _)| !k.to_string_lossy().eq_ignore_ascii_case("TERM") && !k.to_string_lossy().eq_ignore_ascii_case("KIRO_CHAT_UI")).collect();
+    environment.extend([("TERM".into(), "dumb".into()), ("KIRO_CHAT_UI".into(), "classic".into())]);
+    environment.sort_by_key(|(k, _)| k.to_string_lossy().to_ascii_lowercase());
+    let mut env_w = Vec::new();
+    for (key, value) in environment {
+        env_w.extend(key.encode_wide()); env_w.push('=' as u16); env_w.extend(value.encode_wide()); env_w.push(0);
+    }
+    env_w.push(0);
+    let mut pi = PROCESS_INFORMATION::default();
+    unsafe { CreateProcessW(PCWSTR(program_w.as_ptr()), PWSTR(command_w.as_mut_ptr()), None, None, true,
+        EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+        Some(env_w.as_ptr() as _), PCWSTR(cwd_w.as_ptr()), &si.StartupInfo, &mut pi) }.map_err(fail)?;
+    let process = Handle(pi.hProcess); let thread = Handle(pi.hThread);
+    if unsafe { AssignProcessToJobObject(job.0, process.0) }.is_err() {
+        unsafe { let _ = TerminateProcess(process.0, 1); }
+        return Err(ReadError::Process);
+    }
+    // Suspended until inside the job: no child can escape during startup.
+    if unsafe { ResumeThread(thread.0) } == u32::MAX { return Err(ReadError::Process); }
+    drop(out_write); drop(err_write); drop(input);
+    let drain = |mut file: std::fs::File| std::thread::spawn(move || {
+        let mut stored = Vec::new(); let mut chunk = [0u8; 4096]; let mut overflow = false;
+        loop {
+            let n = match file.read(&mut chunk) { Ok(0) | Err(_) => break, Ok(n) => n };
+            let keep = n.min(OUTPUT_LIMIT.saturating_sub(stored.len()));
+            overflow |= keep != n;
+            stored.extend_from_slice(&chunk[..keep]);
+        }
+        (stored, overflow)
+    });
+    let out = drain(stdout); let err = drain(stderr);
+    let done = unsafe { WaitForSingleObject(process.0, timeout.as_millis().min(u32::MAX as u128) as u32) } == WAIT_OBJECT_0;
+    let mut exit = 1;
+    if done { unsafe { let _ = GetExitCodeProcess(process.0, &mut exit); } }
+    // Also kill children after normal exit so they cannot hold pipe writers open.
+    unsafe { let _ = TerminateJobObject(job.0, 1); }
+    drop(job);
+    let (out, out_big) = out.join().map_err(|_| ReadError::Process)?;
+    let (err, err_big) = err.join().map_err(|_| ReadError::Process)?;
+    if !done { return Err(ReadError::TimedOut); }
+    if out_big || err_big { return Err(ReadError::BadOutput); }
+    if exit != 0 { return Err(ReadError::NeedsAuth); }
+    usage_text(&String::from_utf8_lossy(&out), &String::from_utf8_lossy(&err)).ok_or(ReadError::BadOutput)
+}
+
+#[cfg(not(windows))]
+fn run_process(_program: &Path, _args: &[&str], _cwd: &Path, _timeout: Duration) -> Result<String, ReadError> {
+    Err(ReadError::Process)
+}
+
+fn database_paths() -> Vec<PathBuf> {
+    if let Some(p) = std::env::var_os("KIRO_DATA_DIR").filter(|s| !s.is_empty()) {
+        let p = PathBuf::from(p);
+        return if p.is_absolute() { vec![p.join("data.sqlite3")] } else { Vec::new() };
+    }
+    ["LOCALAPPDATA", "APPDATA"].iter().filter_map(|k| std::env::var_os(k))
+        .map(|p| PathBuf::from(p).join("kiro-cli/data.sqlite3")).filter(|p| p.is_absolute()).collect()
+}
+
+fn credentials(path: &Path) -> Option<(String, String)> {
+    use rusqlite::OpenFlags;
+    if !path.is_absolute() || !path.is_file() { return None; }
+    // A filesystem path, not a URI: ?/# cannot change SQLite's opening mode.
+    let conn = rusqlite::Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX).ok()?;
+    conn.busy_timeout(Duration::from_millis(50)).ok()?;
+    conn.execute_batch("PRAGMA query_only=ON;").ok()?;
+    let value = |sql: &str, key: &str| -> Option<serde_json::Value> {
+        let raw: String = conn.query_row(sql, [key], |r| r.get(0)).ok()?;
+        if raw.len() > OUTPUT_LIMIT { return None; }
+        serde_json::from_str(&raw).ok()
+    };
+    let token = value("SELECT value FROM auth_kv WHERE key = ?", "kirocli:odic:token")?;
+    let token = ["access_token", "accessToken"].iter().find_map(|k| token.get(k).and_then(|s| s.as_str()).map(str::trim).filter(|s| !s.is_empty()))?.to_string();
+    let profile = value("SELECT value FROM state WHERE key = ?", "api.codewhisperer.profile")?;
+    let arn = profile.get("arn")?.as_str()?.trim().to_string();
+    endpoint(&arn)?;
+    Some((token, arn))
+}
+
+fn endpoint(arn: &str) -> Option<&'static str> {
+    let p: Vec<_> = arn.splitn(6, ':').collect();
+    if p.len() != 6 || p[0] != "arn" || p[1] != "aws" || p[2] != "codewhisperer"
+        || p[4].is_empty() || !p[5].starts_with("profile/") || p[5].len() <= 8
+        || arn.chars().any(|c| c.is_whitespace() || c.is_control()) { return None; }
+    match p[3] {
+        "us-east-1" => Some("https://codewhisperer.us-east-1.amazonaws.com/"),
+        "eu-central-1" => Some("https://q.eu-central-1.amazonaws.com/"),
+        _ => None,
+    }
+}
+
+#[derive(Debug)]
+struct CreditLimits { plan_used: f64, plan_limit: f64, overage_used: f64, overage_cap: Option<f64>, reset: Option<u64>, bonuses: bool }
+fn parse_limits(v: &serde_json::Value) -> Option<CreditLimits> {
+    let rows: Vec<_> = v.get("usageBreakdownList")?.as_array()?.iter().filter(|r| r.get("resourceType").and_then(|s| s.as_str()) == Some("CREDIT")).collect();
+    if rows.len() != 1 { return None; }
+    let c = rows[0];
+    let number = |precise: &str, legacy: &str| c.get(precise).and_then(|n| n.as_f64())
+        .or_else(|| c.get(legacy).and_then(|n| n.as_f64()));
+    let valid = |n: f64| n.is_finite() && n >= 0.0;
+    let plan_limit = number("usageLimitWithPrecision", "usageLimit")?;
+    let total = number("currentUsageWithPrecision", "currentUsage")?;
+    let overage_used = number("currentOveragesWithPrecision", "currentOverages").unwrap_or(0.0);
+    if !valid(plan_limit) || !valid(total) || !valid(overage_used) || total < overage_used { return None; }
+    let bonuses = c.get("bonuses").and_then(|b| b.as_array()).is_some_and(|a| !a.is_empty());
+    let plan_used = total - overage_used;
+    if !bonuses && plan_used > plan_limit { return None; }
+    let enabled = v.pointer("/overageConfiguration/overageStatus").and_then(|s| s.as_str()).is_some_and(|s| s.eq_ignore_ascii_case("ENABLED"));
+    let overage_cap = if enabled { number("overageCapWithPrecision", "overageCap") } else { None };
+    if overage_cap.is_some_and(|cap| !valid(cap)) { return None; }
+    let reset = c.get("nextDateReset").and_then(|n| n.as_f64()).or_else(|| v.get("nextDateReset").and_then(|n| n.as_f64()))
+        .filter(|n| n.is_finite() && (1_000_000_000.0..=4_102_444_800.0).contains(n)).map(|s| (s * 1000.0) as u64);
+    Some(CreditLimits { plan_used, plan_limit, overage_used, overage_cap, reset, bonuses })
+}
+
+fn apply_limits(reading: &mut Reading, limits: CreditLimits) {
+    if limits.plan_limit > 0.0 && !limits.bonuses {
+        let old = reading.windows.iter().position(|w| w.id == "credits");
+        let reset = limits.reset.or_else(|| old.and_then(|i| reading.windows[i].resets_at));
+        let w = LimitWindow { id: "credits".into(), label: "Credits".into(), used: limits.plan_used / limits.plan_limit, resets_at: reset, ..Default::default() };
+        if let Some(i) = old { reading.windows[i] = w; } else { reading.windows.insert(0, w); }
+    }
+    if let Some(cap) = limits.overage_cap.filter(|c| *c > 0.0) {
+        reading.windows.push(LimitWindow { id: "overage".into(), label: "Overage".into(), used: limits.overage_used / cap, resets_at: limits.reset, ..Default::default() });
+    }
+}
+
+#[derive(Default)]
+struct Enrichment { until: u64, attempts: u32 }
+fn backoff(attempt: u32, retry_after: u64) -> u64 { (60 * (1u64 << attempt.min(4))).max(retry_after).min(900) }
+impl Enrichment {
+    fn enrich(&mut self, reading: &mut Reading) {
+        if self.until > now_ms() { return; }
+        let Some((token, arn)) = database_paths().iter().find_map(|p| credentials(p)) else { return; };
+        let Some(url) = endpoint(&arn) else { return; };
+        let response = ureq::post(url).timeout(Duration::from_secs(10))
+            .set("Content-Type", "application/x-amz-json-1.0")
+            .set("X-Amz-Target", "AmazonCodeWhispererService.GetUsageLimits")
+            .set("Authorization", &format!("Bearer {token}"))
+            .send_json(serde_json::json!({"profileArn":arn}));
+        match response {
+            Ok(r) => {
+                self.until = 0; self.attempts = 0;
+                use std::io::Read;
+                let mut body = String::new();
+                if r.into_reader().take((OUTPUT_LIMIT + 1) as u64).read_to_string(&mut body).is_ok() && body.len() <= OUTPUT_LIMIT {
+                    if let Some(limits) = serde_json::from_str(&body).ok().and_then(|v| parse_limits(&v)) { apply_limits(reading, limits); }
+                }
+            }
+            Err(ureq::Error::Status(429, r)) => {
+                let retry = r.header("Retry-After").and_then(|s| s.trim().parse::<u64>().ok().or_else(||
+                    chrono::DateTime::parse_from_rfc2822(s).ok().map(|d| d.timestamp_millis().saturating_sub(now_ms() as i64).max(0) as u64 / 1000))).unwrap_or(0);
+                self.until = now_ms().saturating_add(backoff(self.attempts, retry) * 1000);
+                self.attempts = self.attempts.saturating_add(1);
+            }
+            _ => {} // CLI windows survive authentication, transport and schema failures.
+        }
+    }
+}
+
+fn from_result(prev: &UsageSnapshot, result: Result<Reading, ReadError>, enrichment: &mut Enrichment) -> UsageSnapshot {
+    match result {
+        Ok(mut reading) => {
+            enrichment.enrich(&mut reading);
+            UsageSnapshot { status: "ok".into(), windows: reading.windows, fetched_at: now_ms(),
+                note: reading.plan.map(|p| format!("{p} · via Kiro CLI")).unwrap_or_else(|| "via Kiro CLI".into()),
+                backoff_until: enrichment.until }
+        }
+        Err(ReadError::NeedsAuth) => UsageSnapshot { status: "needsAuth".into(), note: "Run kiro-cli login to see usage.".into(), ..Default::default() },
+        Err(error) => {
+            let mut snap = prev.clone();
+            snap.status = if snap.windows.is_empty() { "error" } else { "stale" }.into();
+            snap.note = match error { ReadError::TimedOut => "Kiro CLI /usage timed out", ReadError::BadOutput => "Kiro CLI reported no usable usage", _ => "Cannot run Kiro CLI /usage" }.into();
+            snap.backoff_until = enrichment.until;
+            snap
+        }
+    }
+}
+
+pub fn start(app: AppHandle) {
+    std::thread::spawn(move || {
+        let mut enrichment = Enrichment { until: app.state::<AppState>().kiro.lock().unwrap().backoff_until, ..Default::default() };
+        loop {
+            let snap = if let Some(cli) = find_cli() {
+                let dir = std::env::temp_dir().join("codenotch/kiro-usage");
+                let result = std::fs::create_dir_all(&dir).map_err(|_| ReadError::Process)
+                    .and_then(|_| run_process(&cli, &ARGS, &dir, Duration::from_secs(20)))
+                    .and_then(|text| parse_cli(&text, Local::now()));
+                let previous = app.state::<AppState>().kiro.lock().unwrap().clone();
+                from_result(&previous, result, &mut enrichment)
+            } else { enrichment = Enrichment::default(); absent() };
+            *app.state::<AppState>().kiro.lock().unwrap() = snap.clone();
+            let _ = crate::agy_cli::save_persisted_to(&store_path(), &snap);
+            let _ = app.emit("kiro", &snap);
+            for _ in 0..300 {
+                if REFRESH.swap(false, Ordering::Relaxed) { break; }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+    });
+}
+
+pub fn probe() -> String {
+    match find_cli() {
+        Some(path) => format!("Kiro: native CLI at {} (usage checked when polled; SQLite enrichment {})", path.display(), if database_paths().iter().any(|p| credentials(p).is_some()) { "available" } else { "unavailable" }),
+        None => "Kiro: native CLI not found; install it or set an absolute KIRO_CLI_PATH (.exe)".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn clock() -> chrono::DateTime<Local> { Local.with_ymd_and_hms(2026, 1, 10, 12, 0, 0).unwrap() }
+    fn fixture(text: &str) -> Reading { parse_cli(text, clock()).unwrap() }
+    fn scratch(name: &str) -> PathBuf {
+        let p = std::env::temp_dir().join("codenotch").join(format!("kiro-tests-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&p).unwrap(); p
+    }
+    fn limits() -> serde_json::Value {
+        json!({"usageBreakdownList":[{"resourceType":"CREDIT", "currentUsageWithPrecision":3000.25,
+            "usageLimitWithPrecision":3000.0,"currentOveragesWithPrecision":0.25,"overageCapWithPrecision":1000.0,
+            "nextDateReset":1780272000.0}],"overageConfiguration":{"overageStatus":"ENABLED"}})
+    }
+
+    #[test]
+    fn free_tier_and_decimal_ratio_are_used_not_remaining() {
+        let free = fixture("| KIRO FREE |\n█████ 25%\n(12.50 of 50 covered in plan), resets on 01/15");
+        assert_eq!(free.plan.as_deref(), Some("Kiro Free"));
+        assert_eq!(free.windows[0].used, 0.25);
+        let ratio = fixture("| KIRO PRO |\n(0.17 of 50 covered in plan)");
+        assert!((ratio.windows[0].used - 0.0034).abs() < 0.000001);
+        assert!(fixture("Plan: KIRO FREE\n(0.00 of 0 covered in plan)").windows.is_empty());
+    }
+
+    #[test]
+    fn two_x_ansi_card_and_bonus_wallet_preserve_cli_percent() {
+        let text = "\x1b[1mEstimated Usage\x1b[0m | resets on 2026-06-01 | \x1b[mKIRO FREE\x1b[0m\n🎁 Bonus credits: 45.53/2000 credits used, expires in 19 days\nCredits (0.17 of 50 covered in plan)\n███████ 0%\nOverages: Disabled";
+        let r = fixture(text);
+        assert_eq!(r.plan.as_deref(), Some("Kiro Free"));
+        assert_eq!(r.windows.len(), 2);
+        assert_eq!(r.windows[0].id, "credits");
+        assert_eq!(r.windows[0].used, 0.0);
+        assert_eq!(r.windows[1].group.as_deref(), Some("Bonus"));
+        assert!((r.windows[1].used - 45.53 / 2000.0).abs() < 0.000001);
+        assert!(r.windows[1].resets_at.is_some());
+        assert!(!r.windows.iter().any(|w| w.id == "weekly"));
+        assert_eq!(strip_ansi("\x1b]8;;https://kiro.dev\x07hello\x1b]8;;\x1b\\\x1b(Bliteral"), "helloliteral");
+    }
+
+    #[test]
+    fn plan_only_and_managed_accounts_never_claim_zero_usage() {
+        assert!(fixture("\x1b[32mPlan: KIRO PRO MAX | 1 usage breakdowns\x1b[0m").windows.is_empty());
+        let managed = fixture("Plan: Q Developer Pro\nYour plan is managed by admin");
+        assert_eq!(managed.plan.as_deref(), Some("Q Developer Pro"));
+        assert!(managed.windows.is_empty());
+        assert!(matches!(parse_cli("random startup warning", clock()), Err(ReadError::BadOutput)));
+        for text in ["not logged in", "Login required", "Failed to initialize auth portal", "kiro-cli login --use-device-flow", "OAuth error"] {
+            assert!(matches!(parse_cli(text, clock()), Err(ReadError::NeedsAuth)));
+        }
+    }
+
+    #[test]
+    fn reset_dates_use_local_civil_day_and_roll_to_next_year() {
+        let today = Local.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap();
+        let reset = reset_stamp("01/15", today).unwrap();
+        assert_eq!(Local.timestamp_millis_opt(reset as i64).unwrap().year(), 2026);
+        let next = reset_stamp("01/14", today).unwrap();
+        assert_eq!(Local.timestamp_millis_opt(next as i64).unwrap().year(), 2027);
+        assert!(reset_stamp("02/31", today).is_none());
+        assert!(reset_stamp("2026-13-01", today).is_none());
+    }
+
+    #[test]
+    fn streams_choose_usage_card_over_stray_output() {
+        assert_eq!(usage_text("warning", "Estimated Usage | KIRO FREE").as_deref(), Some("Estimated Usage | KIRO FREE"));
+        assert_eq!(usage_text("Estimated Usage", "warning").as_deref(), Some("Estimated Usage"));
+        assert_eq!(usage_text("", "card").as_deref(), Some("card"));
+        assert!(usage_text(" \n", "\t").is_none());
+    }
+
+    #[test]
+    fn native_discovery_rejects_overrides_directories_and_shims() {
+        let dir = scratch("discovery");
+        let exe = dir.join("kiro-cli.exe"); std::fs::write(&exe, "fixture").unwrap();
+        let shim = dir.join("kiro-cli.cmd"); std::fs::write(&shim, "fixture").unwrap();
+        assert_eq!(locate(Some(exe.to_str().unwrap()), &[], None), Some(exe.clone()));
+        assert!(locate(Some("relative/kiro-cli.exe"), &[exe.clone()], None).is_none());
+        assert!(locate(Some(shim.to_str().unwrap()), &[exe.clone()], None).is_none());
+        assert!(locate(Some(dir.to_str().unwrap()), &[exe.clone()], None).is_none());
+        assert!(locate(Some(dir.join("missing.exe").to_str().unwrap()), &[exe.clone()], None).is_none());
+        let path = std::env::join_paths([PathBuf::from("."), dir.clone()]).unwrap();
+        assert_eq!(locate(None, &[], Some(&path)), Some(exe.clone()));
+        let relative = std::env::join_paths([PathBuf::from(".")]).unwrap();
+        assert!(locate(None, &[], Some(&relative)).is_none());
+        std::fs::remove_file(exe).unwrap(); std::fs::remove_file(shim).unwrap(); std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn usage_limits_split_overage_and_keep_bonus_wallet() {
+        let parsed = parse_limits(&limits()).unwrap();
+        assert_eq!(parsed.plan_used, 3000.0);
+        let mut r = fixture("Plan: KIRO POWER\n████ 80%\nBonus credits: 5.00/10 credits used, expires in 7 days");
+        apply_limits(&mut r, parsed);
+        assert_eq!(r.windows.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(), ["credits", "bonus", "overage"]);
+        assert_eq!(r.windows[0].used, 1.0);
+        assert_eq!(r.windows[1].used, 0.5);
+        assert_eq!(r.windows[2].used, 0.00025);
+        let mut v = limits(); v["usageBreakdownList"][0]["bonuses"] = json!([{}]);
+        let mut r = fixture("Plan: KIRO POWER\n████ 80%");
+        apply_limits(&mut r, parse_limits(&v).unwrap());
+        assert_eq!(r.windows[0].used, 0.8, "unseparated API bonus cannot replace CLI credits");
+    }
+
+    #[test]
+    fn malformed_or_ambiguous_limits_do_not_replace_cli() {
+        let mut v = limits(); v["usageBreakdownList"][0]["currentOveragesWithPrecision"] = json!(4000);
+        assert!(parse_limits(&v).is_none());
+        let mut v = limits(); v["usageBreakdownList"][0]["currentUsageWithPrecision"] = json!(4000);
+        assert!(parse_limits(&v).is_none());
+        let mut v = limits(); let duplicate = v["usageBreakdownList"][0].clone(); v["usageBreakdownList"].as_array_mut().unwrap().push(duplicate);
+        assert!(parse_limits(&v).is_none());
+        let mut v = limits(); v["usageBreakdownList"][0]["nextDateReset"] = json!(1780272000000u64);
+        assert!(parse_limits(&v).unwrap().reset.is_none());
+        let mut v = limits(); v["usageBreakdownList"][0]["currentUsageWithPrecision"] = serde_json::Value::Null;
+        v["usageBreakdownList"][0]["currentUsage"] = json!(2000);
+        assert_eq!(parse_limits(&v).unwrap().plan_used, 1999.75);
+        let mut v = limits(); v["overageConfiguration"]["overageStatus"] = json!("DISABLED");
+        assert!(parse_limits(&v).unwrap().overage_cap.is_none());
+    }
+
+    #[test]
+    fn regional_arn_is_a_host_allowlist() {
+        assert_eq!(endpoint("arn:aws:codewhisperer:us-east-1:123:profile/test"), Some("https://codewhisperer.us-east-1.amazonaws.com/"));
+        assert_eq!(endpoint("arn:aws:codewhisperer:eu-central-1:123:profile/test"), Some("https://q.eu-central-1.amazonaws.com/"));
+        for arn in ["arn:aws:codewhisperer:us-west-2:123:profile/test", "arn:aws:evil:us-east-1:123:profile/test", "arn:aws:codewhisperer:us-east-1:123:profile/", "arn:aws:codewhisperer:us-east-1:123:profile/test\n"] { assert!(endpoint(arn).is_none()); }
+    }
+
+    #[test]
+    fn sqlite_borrowing_does_not_modify_owner_credentials() {
+        let dir = scratch("sqlite"); let path = dir.join("data.sqlite3");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE auth_kv(key TEXT, value TEXT); CREATE TABLE state(key TEXT, value TEXT);").unwrap();
+        conn.execute("INSERT INTO auth_kv VALUES (?1, ?2)", ["kirocli:odic:token", "{\"accessToken\":\"fixture-access-only\",\"refresh_token\":\"fixture\"}"]).unwrap();
+        conn.execute("INSERT INTO state VALUES (?1, ?2)", ["api.codewhisperer.profile", "{\"arn\":\"arn:aws:codewhisperer:us-east-1:123:profile/test\"}"]).unwrap();
+        drop(conn);
+        let before = std::fs::read(&path).unwrap();
+        let (token, _) = credentials(&path).unwrap(); assert_eq!(token, "fixture-access-only");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_file(path).unwrap(); std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn errors_keep_history_and_enrichment_backoff_does_not_block_cli() {
+        let prev = UsageSnapshot { status: "ok".into(), windows: fixture("Plan: KIRO FREE\n████ 25%").windows, fetched_at: 1, ..Default::default() };
+        let mut e = Enrichment { until: u64::MAX, attempts: 3 };
+        let stale = from_result(&prev, Err(ReadError::TimedOut), &mut e);
+        assert_eq!(stale.status, "stale"); assert_eq!(stale.fetched_at, 1);
+        let signed_out = from_result(&prev, Err(ReadError::NeedsAuth), &mut e);
+        assert_eq!(signed_out.status, "needsAuth"); assert!(signed_out.windows.is_empty());
+        let current = from_result(&prev, Ok(fixture("Plan: KIRO FREE\n████ 10%")), &mut e);
+        assert_eq!(current.status, "ok"); assert_eq!(current.windows[0].used, 0.1);
+        let plan_only = from_result(&prev, Ok(fixture("Plan: Q Developer Pro")), &mut e);
+        assert!(plan_only.windows.is_empty());
+        assert!(absent().windows.is_empty());
+        assert_eq!(backoff(0, 0), 60); assert_eq!(backoff(3, 0), 480); assert_eq!(backoff(9, 3600), 900);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_runner_drains_both_streams_and_owns_child_timeout() {
+        let dir = scratch("runner");
+        let cmd = PathBuf::from(std::env::var_os("ComSpec").unwrap());
+        let script = dir.join("fixture.cmd");
+        std::fs::write(&script, "@echo off\r\necho warning\r\necho Estimated Usage 1>&2\r\necho %TERM% %KIRO_CHAT_UI% 1>&2\r\n").unwrap();
+        let text = run_process(&cmd, &["/D", "/C", script.to_str().unwrap()], &dir, Duration::from_secs(3)).unwrap();
+        assert!(text.contains("Estimated Usage")); assert!(text.contains("dumb classic"));
+        // Child would write later if it escaped the JobObject.
+        let child = dir.join("child.cmd");
+        let marker = dir.join("escaped.txt");
+        std::fs::write(&child, "@echo off\r\nping -n 3 127.0.0.1 >nul\r\necho escaped >escaped.txt\r\n").unwrap();
+        std::fs::write(&script, "@echo off\r\nstart \"\" /b cmd /d /c child.cmd\r\nping -n 20 127.0.0.1 >nul\r\n").unwrap();
+        let started = std::time::Instant::now();
+        assert!(matches!(run_process(&cmd, &["/D", "/C", script.to_str().unwrap()], &dir, Duration::from_millis(300)), Err(ReadError::TimedOut)));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        std::thread::sleep(Duration::from_secs(3)); assert!(!marker.exists());
+        std::fs::write(&script, "@echo off\r\nfor /l %%i in (1,1,10000) do echo Estimated Usage output overflow\r\n").unwrap();
+        assert!(matches!(run_process(&cmd, &["/D", "/C", script.to_str().unwrap()], &dir, Duration::from_secs(5)), Err(ReadError::BadOutput)));
+        std::fs::remove_file(script).unwrap(); std::fs::remove_file(child).unwrap(); std::fs::remove_dir(dir).unwrap();
+    }
+}

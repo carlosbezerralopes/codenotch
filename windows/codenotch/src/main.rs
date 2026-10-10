@@ -23,6 +23,7 @@ mod copilot;
 mod antigravity;
 mod glm;
 mod opencode;
+mod kiro;
 mod agy_cli;
 mod glyphs;
 mod trayicon;
@@ -67,6 +68,7 @@ pub struct AppState {
     pub glm: Mutex<usage::UsageSnapshot>,
     /// OpenCode Go plan snapshot, read with OpenCode's own sign-in (auth.json or opencode.db).
     pub opencode: Mutex<usage::UsageSnapshot>,
+    pub kiro: Mutex<usage::UsageSnapshot>,
     /// Provider glyph cache, collected at launch and again on a tray refresh
     pub glyphs: Mutex<std::collections::HashMap<String, glyphs::Glyph>>,
     /// Working state of the non-Claude providers (Cursor reports it; Codex and Antigravity are inferred from recent writes)
@@ -504,6 +506,7 @@ pub(crate) fn refresh_provider(app: &AppHandle, provider: &str) -> bool {
         "gemini" => antigravity::request_refresh(),
         "glm" => glm::request_refresh(),
         "opencode" => opencode::request_refresh(),
+        "kiro" => kiro::request_refresh(),
         _ => return false,
     }
     true
@@ -536,6 +539,11 @@ fn get_glm(state: tauri::State<AppState>) -> usage::UsageSnapshot {
 #[tauri::command]
 fn get_opencode(state: tauri::State<AppState>) -> usage::UsageSnapshot {
     state.opencode.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn get_kiro(state: tauri::State<AppState>) -> usage::UsageSnapshot {
+    state.kiro.lock().unwrap().clone()
 }
 
 #[tauri::command]
@@ -604,6 +612,7 @@ pub(crate) fn provider_page(provider: &str) -> Option<(&'static str, &'static st
         "gemini" => ("https://antigravity.google", "antigravity.google"),
         "glm" => ("https://z.ai/manage-apikey/apikey-list", "z.ai"),
         "opencode" => ("https://opencode.ai", "opencode.ai"),
+        "kiro" => ("https://app.kiro.dev/account/usage", "app.kiro.dev"),
         _ => return None,
     })
 }
@@ -1164,6 +1173,7 @@ fn ring_window<'a>(
         "glm" => by_id("session"),
         // The Mac sets headlineID "rolling", weeklyID "weekly".
         "opencode" => by_id("rolling"),
+        "kiro" => by_id("credits"),
         _ => antigravity_lane(windows, antigravity_limit, antigravity_model),
     }
 }
@@ -1222,6 +1232,7 @@ pub(crate) fn snapshot_of(app: &AppHandle, id: &str) -> usage::UsageSnapshot {
         "gemini" => st.antigravity.lock().unwrap().clone(),
         "glm" => st.glm.lock().unwrap().clone(),
         "opencode" => st.opencode.lock().unwrap().clone(),
+        "kiro" => st.kiro.lock().unwrap().clone(),
         _ => st.usage.lock().unwrap().clone(),
     }
 }
@@ -1624,12 +1635,13 @@ pub fn provider_label(id: &str) -> &'static str {
         "gemini" => "Antigravity",
         "glm" => "z.ai",
         "opencode" => "OpenCode",
+        "kiro" => "Kiro",
         _ => "Claude",
     }
 }
 
 /// Every provider the tray menu can offer, in the order the notch shows them.
-pub const TRAY_PROVIDER_IDS: [&str; 8] = ["claude", "codex", "glm", "opencode", "cursor", "grok", "copilot", "gemini"];
+pub const TRAY_PROVIDER_IDS: [&str; 9] = ["claude", "codex", "glm", "opencode", "cursor", "grok", "copilot", "gemini", "kiro"];
 
 /// Keeps the tray menu current. macOS rebuilds its menu as it opens; Tauri has no such hook, so it
 /// is rebuilt whenever a reading changes, and once a minute besides — otherwise "Resets in 12 min"
@@ -1821,6 +1833,7 @@ fn main() {
             antigravity: Mutex::new(antigravity::load_persisted()),
             glm: Mutex::new(glm::load_persisted()),
             opencode: Mutex::new(opencode::load_persisted()),
+            kiro: Mutex::new(kiro::load_persisted()),
             glyphs: Mutex::new(Default::default()),
             activity: Mutex::new(Vec::new()),
         })
@@ -1846,6 +1859,7 @@ fn main() {
             get_antigravity,
             get_glm,
             get_opencode,
+            get_kiro,
             get_glyphs,
             get_activity,
             open_data_dir,
@@ -1932,6 +1946,7 @@ fn main() {
             antigravity::start(handle.clone());
             glm::start(handle.clone());
             opencode::start(handle.clone());
+            kiro::start(handle.clone());
             activity::start(handle.clone());
             reset_watch::start(handle.clone());
             // Collecting glyphs may read icon resources out of a few executables; do it off the main thread and push when done
@@ -2281,6 +2296,13 @@ mod tests {
         assert_eq!(pick("codex", &[win("spark", 0.1), win("secondary", 0.4)]), None);
         assert_eq!(pick("codex", &[win("secondary", 0.4)]), None);
         assert_eq!(pick("codex", &[win("spark", 0.1), win("code-review", 0.2)]), None);
+    }
+
+    #[test]
+    fn kiro_headline_never_uses_bonus_or_overage() {
+        assert_eq!(pick("kiro", &[win("bonus", 0.9), win("credits", 0.3), win("overage", 1.0)]), Some("credits"));
+        assert_eq!(pick("kiro", &[win("bonus", 0.9), win("overage", 1.0)]), None);
+        assert_eq!(pick("kiro", &[]), None);
     }
 
     #[test]

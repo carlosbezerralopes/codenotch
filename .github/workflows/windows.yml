@@ -16,7 +16,6 @@ on:
 
 jobs:
   build:
-    if: github.repository == 'vinzdg/codenotch'
     name: Build and test
     runs-on: windows-latest
     defaults:
@@ -61,6 +60,9 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+      - name: Test Kiro ring and fork updates
+        run: node --test test-kiro.cjs scripts/test-fork-updates.cjs
+
       - name: Test Codex headline selection
         run: node --test test-codex-headline.cjs
 
@@ -72,7 +74,6 @@ jobs:
   # The same crate builds on Linux, where the Win32 paths compile out. Kept to a
   # build and the tests: there is no runner with a desktop to show a notch on.
   linux:
-    if: github.repository == 'vinzdg/codenotch'
     name: Build and test (Linux)
     runs-on: ubuntu-latest
     defaults:
