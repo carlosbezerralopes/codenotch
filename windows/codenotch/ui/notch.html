@@ -135,10 +135,18 @@
   .w-track{height:4px;border-radius:2px;background:var(--bar);margin:6px 0 4px;overflow:hidden}
   .w-fill{height:100%;border-radius:2px}
   .w-used{font-size:11px;color:var(--ink-dim)}
+  .pace-label{display:flex;justify-content:space-between;gap:8px;font-size:11px;color:var(--ink-3);margin-top:7px;flex-wrap:wrap}
+  .pace-track{height:4px;background:var(--bar);border-radius:2px;margin:5px 0;overflow:hidden}
+  .pace-fill{height:100%;background:var(--ink-dim);opacity:.7}
+  .pace-note{font-size:10px;color:var(--ink-dim);margin-top:5px;line-height:1.4}
   .g-head{font-size:12px;font-weight:700;color:var(--ink-2);margin-top:12px}
   .g-box{border:1px solid var(--card-line);border-radius:10px;padding:0 10px 8px;margin-top:6px}
   .c-note{font-size:12px;color:var(--ink-3);line-height:1.5;margin-top:6px}
   .c-sessions{margin-top:12px;border-top:1px solid var(--card-rule);padding-top:8px}
+  .c-activity-summary{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--ink-4)}
+  .activity-toggle{margin-left:auto;border:1px solid var(--card-line);border-radius:5px;background:transparent;color:var(--ink-2);padding:3px 6px;font:inherit;cursor:pointer;flex:none}
+  .activity-toggle:focus-visible{outline:2px solid var(--ink-2);outline-offset:2px}
+  #activity-details{margin-top:6px}
   .s-row{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--ink-4);padding:2px 0}
   .s-dot{width:6px;height:6px;border-radius:3px;flex:0 0 auto}
   .s-more{font-size:11px;color:var(--ink-dim);padding:2px 0}
@@ -392,6 +400,20 @@ function usedCopy(w){
   if(w.derived) used='~'+used;
   return ui().usedLeft(used,left);
 }
+// BEGIN TESTABLE CREDIT AMOUNTS
+function creditAmountsCopy(w){
+  const a=w.credits;
+  if(!a||!Number.isFinite(a.consumed)||!Number.isFinite(a.allowance)||a.consumed<0||a.allowance<=0) return '';
+  const number=n=>new Intl.NumberFormat(ui().locale,{minimumFractionDigits:Number.isInteger(n)?0:2,maximumFractionDigits:6}).format(n);
+  const consumed=number(a.consumed), allowance=number(a.allowance);
+  return ui().creditsUsed(consumed,allowance);
+}
+function creditAmountsHtml(p,w){
+  if(p.base!=='kiro') return '';
+  const copy=creditAmountsCopy(w);
+  return copy?`<div class="w-used w-credits">${esc(copy)}</div>`:'';
+}
+// END TESTABLE CREDIT AMOUNTS
 
 let usage={status:'',windows:[],fetched_at:0,note:''};
 let codexSnap={status:'absent',windows:[],fetched_at:0,note:''};
@@ -1031,31 +1053,31 @@ const UI={
   ko:{locale:'ko-KR',title:n=>n+' 사용량',resetting:'재설정 중…',resetsIn:m=>`${m}분 후 재설정`,
       resetsAt:t=>`${t}에 재설정`,resetsOn:(d,t)=>`${d} ${t}에 재설정`,resetsDate:d=>`${d}에 재설정`,
       ago:m=>m<60?`${m}분 전`:`${Math.round(m/60)}시간 전`,
-      usedLeft:(used,left)=>`${used}% 사용 · ${left}% 남음`,andMore:n=>`외 ${n}개`,updated:a=>`${a}에 마지막 업데이트됨`},
+      creditsUsed:(used,total)=>`${total} 크레딧 중 ${used} 사용`,usedLeft:(used,left)=>`${used}% 사용 · ${left}% 남음`,andMore:n=>`외 ${n}개`,updated:a=>`${a}에 마지막 업데이트됨`},
   'pt-BR':{locale:'pt-BR',title:n=>'Uso do '+n,resetting:'Renovando…',resetsIn:m=>`Renova em ${m} min`,
       resetsAt:t=>`Renova às ${t}`,resetsOn:(d,t)=>`Renova ${d} às ${t}`,resetsDate:d=>`Renova ${d}`,
       ago:m=>m<60?`há ${m} min`:`há ${Math.round(m/60)} h`,
-      usedLeft:(used,left)=>`${used}% usado · ${left}% restante`,andMore:n=>`e mais ${n}`},
+      creditsUsed:(used,total)=>`${used} de ${total} créditos consumidos`,usedLeft:(used,left)=>`${used}% usado · ${left}% restante`,andMore:n=>`e mais ${n}`},
   en:{locale:'en-US',title:n=>n+' Usage',resetting:'Resetting…',resetsIn:m=>`Resets in ${m} min`,
       resetsAt:t=>`Resets at ${t}`,resetsOn:(d,t)=>`Resets ${d} ${t}`,resetsDate:d=>`Resets ${d}`,
       ago:m=>m<60?`${m}m ago`:`${Math.round(m/60)}h ago`,
-      usedLeft:(used,left)=>`${used}% Used · ${left}% left`,andMore:n=>`and ${n} more`,updated:a=>`Updated ${a}`},
+      creditsUsed:(used,total)=>`${used} of ${total} credits used`,usedLeft:(used,left)=>`${used}% Used · ${left}% left`,andMore:n=>`and ${n} more`,updated:a=>`Updated ${a}`},
   uk:{locale:'uk-UA',title:n=>'Використання '+n,resetting:'Скидання…',resetsIn:m=>`Скидання через ${m} хв`,
       resetsAt:t=>`Скидання о ${t}`,resetsOn:(d,t)=>`Скидання: ${d} ${t}`,resetsDate:d=>`Скидання: ${d}`,
       ago:m=>m<60?`${m} хв тому`:`${Math.round(m/60)} год тому`,
-      usedLeft:(used,left)=>`Використано ${used}% · лишилось ${left}%`,andMore:n=>`і ще ${n}`,updated:a=>`Оновлено ${a}`},
+      creditsUsed:(used,total)=>`Використано ${used} із ${total} кредитів`,usedLeft:(used,left)=>`Використано ${used}% · лишилось ${left}%`,andMore:n=>`і ще ${n}`,updated:a=>`Оновлено ${a}`},
   ru:{locale:'ru-RU',title:n=>'Использование '+n,resetting:'Сброс…',resetsIn:m=>`Сброс через ${m} мин`,
       resetsAt:t=>`Сброс в ${t}`,resetsOn:(d,t)=>`Сброс: ${d} ${t}`,resetsDate:d=>`Сброс: ${d}`,
       ago:m=>m<60?`${m} мин назад`:`${Math.round(m/60)} ч назад`,
-      usedLeft:(used,left)=>`Использовано ${used}% · осталось ${left}%`,andMore:n=>`и ещё ${n}`,updated:a=>`Обновлено ${a}`},
+      creditsUsed:(used,total)=>`Использовано ${used} из ${total} кредитов`,usedLeft:(used,left)=>`Использовано ${used}% · осталось ${left}%`,andMore:n=>`и ещё ${n}`,updated:a=>`Обновлено ${a}`},
   zh:{locale:'zh-CN',title:n=>n+' 用量',resetting:'正在重置…',resetsIn:m=>`${m} 分钟后重置`,
       resetsAt:t=>`${t} 重置`,resetsOn:(d,t)=>`${d} ${t} 重置`,resetsDate:d=>`${d} 重置`,
       ago:m=>m<60?`${m} 分钟前`:`${Math.round(m/60)} 小时前`,
-      usedLeft:(used,left)=>`已用 ${used}% · 剩余 ${left}%`,andMore:n=>`另有 ${n} 个`,updated:a=>`更新于 ${a}`},
+      creditsUsed:(used,total)=>`已用 ${used} / ${total} 积分`,usedLeft:(used,left)=>`已用 ${used}% · 剩余 ${left}%`,andMore:n=>`另有 ${n} 个`,updated:a=>`更新于 ${a}`},
   'zh-Hant':{locale:'zh-TW',title:n=>n+' 用量',resetting:'正在重置…',resetsIn:m=>`${m} 分鐘後重置`,
       resetsAt:t=>`${t} 重置`,resetsOn:(d,t)=>`${d} ${t} 重置`,resetsDate:d=>`${d} 重置`,
       ago:m=>m<60?`${m} 分鐘前`:`${Math.round(m/60)} 小時前`,
-      usedLeft:(used,left)=>`已用 ${used}% · 剩餘 ${left}%`,andMore:n=>`另有 ${n} 個`,updated:a=>`更新於 ${a}`},
+      creditsUsed:(used,total)=>`已用 ${used} / ${total} 積分`,usedLeft:(used,left)=>`已用 ${used}% · 剩餘 ${left}%`,andMore:n=>`另有 ${n} 個`,updated:a=>`更新於 ${a}`},
 };
 function ui(){return UI[uiLang]||UI.en;}
 function textCopy(value){
@@ -1091,12 +1113,29 @@ function workState(id){
 function glyphHtml(p,small){
   const g=glyphs[p.base||p.id];
   if(g&&g.kind==='svg'&&g.svg) return `<span class="mark">${g.svg}</span>`;
-  if(g&&g.url) return `<img class="${g.kind}" src="${g.url}" alt="${p.name}"${small?' style="width:16px;height:16px;border-radius:4px"':''}>`;
+  if(g&&g.url) return `<img class="${g.kind}" src="${g.url}" alt="${esc(p.name)}"${small?' style="width:16px;height:16px;border-radius:4px"':''}>`;
   return small?'':p.glyph; // fallback letter
 }
 // Provider table (order = top to bottom in the pill). `glyph` is the fallback letter used when no mark is available
 // Which providers get a ring: [{provider}]. null or an empty list means every provider.
 let notchSlots=null;
+let providerOrder=[], providerNicknames={};
+// BEGIN TESTABLE PROVIDER PRESENTATION
+function providerDisplayName(base, original, id){
+  const name=providerNicknames[base];
+  if(!name) return original;
+  if(base!=='claude') return name;
+  let suffix=original.replace(/^Claude\b\s*/, '').trim();
+  const slug=String(id).split('@')[1];
+  if(slug && !suffix.includes(slug)) suffix=slug+(suffix?' · '+suffix:'');
+  return name+(suffix?(suffix.startsWith('(')?' '+suffix:' ('+suffix+')'):'');
+}
+function presentProviders(list){
+  const positions=new Map(providerOrder.map((id,i)=>[id,i]));
+  return list.map(p=>Object.assign({},p,{name:providerDisplayName(p.base,p.name,p.id)}))
+    .sort((a,b)=>(positions.get(a.base)??Infinity)-(positions.get(b.base)??Infinity));
+}
+// END TESTABLE PROVIDER PRESENTATION
 function slotFor(id){
   if(!Array.isArray(notchSlots)) return null;
   for(const s of notchSlots){ if(s&&s.provider===id) return s; }
@@ -1136,11 +1175,10 @@ function providers(){
   if(kiroSnap.status!=='absent') list.push({id:'kiro',base:'kiro',name:'Kiro',glyph:'K',snap:kiroSnap});
   if(Array.isArray(notchSlots)&&notchSlots.length){
     const picked=list.filter(p=>!!slotFor(p.base));
-    // Never leave the notch with nothing in it: an empty result means the choice no longer matches
-    // any available provider, so fall back to showing everything rather than an empty pill.
-    if(picked.length) return picked;
+    // Keep an explicit selection while its providers are unavailable.
+    return presentProviders(picked);
   }
-  return list;
+  return presentProviders(list);
 }
 // Antigravity's "Notch reads" and "Model data", as in the Mac app; chosen in settings
 let agPrefs={limit:'automatic',model:'gemini'};
@@ -1181,7 +1219,13 @@ function weeklyOf(snap,id){
   const ws=snap.windows.filter(w=>w.count==null); if(!ws.length) return null;
   const byId=x=>ws.find(w=>w.id===x)||null;
   if(id==='claude') return byId('seven_day')||byId('weekly_all')||byId('weekly');
-  if(id==='codex') return byId('secondary');
+  if(id==='codex'){
+    const isWeek=w=>w&&Number.isSafeInteger(w.duration_seconds)&&w.duration_seconds>=6*86400&&w.duration_seconds<=8*86400;
+    // A core primary week already owns the main ring; do not duplicate it or promote an extra bucket.
+    if(isWeek(byId('primary'))) return null;
+    const secondary=byId('secondary');
+    return isWeek(secondary)?secondary:null;
+  }
   if(id==='cursor') return null;
   if(id==='grok') return null; // the credits window is already the weekly one
   if(id==='copilot') return null; // monthly quotas only; nothing weekly to draw
@@ -1306,6 +1350,144 @@ const STATE_DOT={running:INK,attention:WATCH,done:AMPLE,idle:TRACK};
 const SESSION_ROWS=5;
 function moreRow(n){ return n>0?`<div class="s-more">${ui().andMore(n)}</div>`:''; }
 
+// BEGIN TESTABLE ACTIVITY PRIVACY
+let activityDetailsExpanded=false, activityDetailsProvider=null;
+const ACTIVITY_TEXT={
+  en:{running:'Working',attention:'Waiting for your input',done:'Finished',idle:'No activity detected',unmonitored:'Activity not monitored',show:'Show details',hide:'Hide details'},
+  'pt-BR':{running:'Trabalhando',attention:'Aguardando sua resposta',done:'Concluído',idle:'Sem atividade detectada',unmonitored:'Atividade não monitorada',show:'Mostrar detalhes',hide:'Ocultar detalhes'},
+};
+function resetActivityDetails(){
+  activityDetailsExpanded=false;
+  activityDetailsProvider=null;
+}
+function selectActivityProvider(id){
+  if(activityDetailsProvider!==id){activityDetailsExpanded=false;activityDetailsProvider=id;}
+}
+function activityStatus(base){
+  if(base==='kiro') return 'unmonitored';
+  const acts=Array.isArray(activity)?activity.filter(a=>a.provider===base):[];
+  if(base==='claude'){
+    if(['running','attention'].includes(stateSnap.agg)) return stateSnap.agg;
+    if(acts.some(a=>a.state==='waiting')) return 'attention';
+    if(acts.some(a=>a.state==='busy')) return 'running';
+    if(stateSnap.agg==='done') return 'done';
+    return stateSnap.agg==='idle'?'idle':'unmonitored';
+  }
+  if(acts.some(a=>a.state==='waiting')) return 'attention';
+  if(acts.some(a=>a.state==='busy')) return 'running';
+  // These are the providers covered by activity.rs; quota support alone is not activity detection.
+  return ['codex','cursor','gemini'].includes(base)?'idle':'unmonitored';
+}
+function hasActivityDetails(p){
+  if(p.base==='kiro') return false;
+  if(p.base==='claude') return Array.isArray(stateSnap.sessions)&&stateSnap.sessions.some(s=>s.state!=='idle');
+  return Array.isArray(activity)&&activity.some(a=>a.provider===p.base);
+}
+function activityDetailsHtml(p){
+  let html='';
+  if(p.base==='claude'){
+    const sessions=(Array.isArray(stateSnap.sessions)?stateSnap.sessions:[]).filter(s=>s.state!=='idle');
+    for(const s of sessions.slice(0,SESSION_ROWS)){
+      html+=`<div class="s-row"><span class="s-dot" style="background:${STATE_DOT[s.state]||'#666'}"></span>${esc(s.title)}</div>`;
+    }
+    html+=moreRow(sessions.length-SESSION_ROWS);
+  }else{
+    const acts=(Array.isArray(activity)?activity:[]).filter(a=>a.provider===p.base)
+      .sort((a,b)=>(b.state==='waiting')-(a.state==='waiting')||b.since-a.since);
+    for(const a of acts.slice(0,SESSION_ROWS)){
+      const color=a.state==='waiting'?WATCH:INK;
+      html+=`<div class="s-row"><span class="s-dot" style="background:${color}"></span>${esc(a.name)}<span style="color:#808080;margin-left:auto">${esc(textCopy(a.detail))}</span></div>`;
+    }
+    html+=moreRow(acts.length-SESSION_ROWS);
+  }
+  return html;
+}
+function activityPrivacyHtml(p){
+  const words=ACTIVITY_TEXT[uiLang]||ACTIVITY_TEXT.en;
+  const state=activityStatus(p.base), details=hasActivityDetails(p);
+  const color=STATE_DOT[state]||TRACK;
+  let html=`<div class="c-sessions c-activity"><div class="c-activity-summary"><span class="s-dot" style="background:${color}"></span><span role="status">${esc(words[state])}</span>`;
+  if(details) html+=`<button id="activity-details-toggle" class="activity-toggle" aria-expanded="${activityDetailsExpanded}" aria-controls="activity-details">${esc(activityDetailsExpanded?words.hide:words.show)}</button>`;
+  html+='</div>';
+  // Sensitive rows are generated only after the user explicitly opens them.
+  if(details&&activityDetailsExpanded) html+=`<div id="activity-details">${activityDetailsHtml(p)}</div>`;
+  return html+'</div>';
+}
+function activityPrivacyClick(event,p){
+  const toggle=event.target.closest('#activity-details-toggle');
+  if(!toggle&&event.target.closest('button,a,input,select,textarea,[role="button"]')) return;
+  if(!hasActivityDetails(p)||(!toggle&&activityDetailsExpanded)) return;
+  event.stopPropagation();
+  activityDetailsExpanded=toggle?!activityDetailsExpanded:true;
+  renderCard();
+  const button=document.getElementById('card').querySelector('#activity-details-toggle');
+  if(button) button.focus();
+}
+// END TESTABLE ACTIVITY PRIVACY
+
+// BEGIN TESTABLE WORK PACE
+let workCalendar=null;
+const PACE_DAY_MS=86400000;
+const PACE_TEXT={
+  en:{official:'Official quota',elapsed:'Elapsed time · derived',business:'Business days · derived',partial:'Business days · partial calendar',unavailable:'Business days unavailable',calendarMissing:'Calendar unavailable. Check the location in Settings.',noWorkdays:'No business time in this cycle.',outsideCoverage:'Calendar does not cover this cycle.',localMissing:'Local holidays are not confirmed. Add your nonworking dates in Settings.',extra:'Weekend and holiday spending still counts towards the official quota.',days:'days',above:'pp above business time',below:'pp below business time',equal:'Usage matches business time'},
+  'pt-BR':{official:'Cota oficial',elapsed:'Tempo corrido · derivado',business:'Dias úteis · derivado',partial:'Dias úteis · calendário parcial',unavailable:'Dias úteis indisponíveis',calendarMissing:'Calendário indisponível. Confira a localização nas Configurações.',noWorkdays:'Não há tempo útil neste ciclo.',outsideCoverage:'O calendário não cobre este ciclo.',localMissing:'Feriados locais não confirmados. Cadastre suas datas sem trabalho nas Configurações.',extra:'O consumo em fins de semana e feriados continua contando na cota oficial.',days:'dias',above:'pp acima do tempo útil',below:'pp abaixo do tempo útil',equal:'Consumo igual ao tempo útil'},
+};
+function paceWords(){return PACE_TEXT[uiLang]||PACE_TEXT.en;}
+function computePace(window,snapshot,now=Date.now(),calendar=workCalendar){
+  const duration=window.duration_seconds, reset=window.resets_at, fetched=snapshot.fetched_at;
+  if(snapshot.status!=='ok'||!Number.isFinite(fetched)||fetched<=0||fetched>now||now-fetched>900000
+    ||!Number.isSafeInteger(duration)||duration<6*86400||duration>8*86400
+    ||!Number.isSafeInteger(reset)||reset<=now||!Number.isFinite(window.used)||window.used<0||window.used>1||window.count!=null) return null;
+  const start=reset-duration*1000;
+  if(start<=0||now<start) return null;
+  const result={elapsed:(now-start)/(reset-start),business:null,elapsed_days:null,total_days:null,gap_pp:null,partial:true,reason:'calendarMissing'};
+  if(!calendar||!Number.isInteger(calendar.utc_offset_minutes)||calendar.utc_offset_minutes< -720||calendar.utc_offset_minutes>840
+    ||!Array.isArray(calendar.holidays)||!Array.isArray(calendar.overrides)||!Array.isArray(calendar.covered_years)) return result;
+  const offset=calendar.utc_offset_minutes*60000;
+  const holidays=new Set(calendar.holidays.map(day=>day.date));
+  const overrides=new Map(calendar.overrides.map(day=>[day.date,day.nonworking]));
+  let total=0,elapsed=0;
+  for(let day=Math.floor((start+offset)/PACE_DAY_MS);day*PACE_DAY_MS-offset<reset;day++){
+    const local=new Date(day*PACE_DAY_MS),date=local.toISOString().slice(0,10);
+    if(!calendar.covered_years.includes(local.getUTCFullYear())){result.reason='outsideCoverage';return result;}
+    const weekday=local.getUTCDay();
+    const nonworking=overrides.has(date)?overrides.get(date):holidays.has(date);
+    if(weekday===0||weekday===6||nonworking) continue;
+    const from=Math.max(start,day*PACE_DAY_MS-offset),to=Math.min(reset,(day+1)*PACE_DAY_MS-offset);
+    total+=to-from;
+    elapsed+=Math.max(0,Math.min(now,to)-from);
+  }
+  result.partial=!(calendar.source_coverage&&calendar.source_coverage.national&&calendar.source_coverage.state&&calendar.source_coverage.municipal);
+  if(total<=0){result.reason='noWorkdays';return result;}
+  result.business=elapsed/total;
+  result.elapsed_days=elapsed/PACE_DAY_MS;
+  result.total_days=total/PACE_DAY_MS;
+  result.gap_pp=(window.used-result.business)*100;
+  result.reason='';
+  return result;
+}
+function paceNumber(value,maximum=2){
+  return new Intl.NumberFormat(ui().locale,{maximumFractionDigits:maximum}).format(value);
+}
+function paceTrack(label,fraction,value){
+  const percent=Math.max(0,Math.min(100,fraction*100));
+  return `<div class="pace-label"><span>${esc(label)}</span><span>${esc(value)}</span></div><div class="pace-track" role="progressbar" aria-label="${esc(label)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent.toFixed(2)}"><div class="pace-fill" style="width:${percent.toFixed(2)}%"></div></div>`;
+}
+function workPaceHtml(pace){
+  const words=paceWords();
+  let html=paceTrack(words.elapsed,pace.elapsed,paceNumber(pace.elapsed*100,1)+'%');
+  if(pace.business===null){
+    return html+`<div class="pace-label">${esc(words.unavailable)}</div><div class="pace-note">${esc(words[pace.reason]||words.calendarMissing)}</div>`;
+  }
+  const days=paceNumber(pace.elapsed_days)+' / '+paceNumber(pace.total_days)+' '+words.days;
+  html+=paceTrack(pace.partial?words.partial:words.business,pace.business,days+' · '+paceNumber(pace.business*100,1)+'%');
+  const gap=Math.abs(pace.gap_pp)<0.05?words.equal:paceNumber(Math.abs(pace.gap_pp),1)+' '+(pace.gap_pp>0?words.above:words.below);
+  html+=`<div class="pace-note">${esc(gap)}</div>`;
+  if(pace.partial) html+=`<div class="pace-note">${esc(words.localMissing)}</div>`;
+  return html+`<div class="pace-note">${esc(words.extra)}</div>`;
+}
+// END TESTABLE WORK PACE
+
 let hoverId='claude';
 let claudeAuth={busy:false,message:''};
 let claudeActionMessage='';
@@ -1332,7 +1514,11 @@ async function signInClaude(){
 // CLAUDE_AUTH_ACTIONS_END
 function renderCard(){
   const c=document.getElementById('card');
-  const p=providers().find(x=>x.id===hoverId)||providers()[0];
+  const list=providers();
+  const p=list.find(x=>x.id===hoverId)||list[0];
+  if(!p){ hoverId=null; c.innerHTML=''; hideCard(); return; }
+  selectActivityProvider(p.id);
+  hoverId=p.id;
   const snap=p.snap;
   const headIcon=glyphHtml(p,true);
   // p.name is no longer a constant: for a second account it is built from the home
@@ -1358,38 +1544,23 @@ function renderCard(){
           <div class="w-used">${w.count>0?`~${w.count} ${textCopy(w.count===1?'request today':'requests today')}`:textCopy('no requests today')}</div></div>`;
         continue;
       }
+      const pace=p.base==='codex'?computePace(w,snap):null;
       html+=`<div class="win">
         <div class="w-row"><span class="w-label">${esc(textCopy(w.label))}</span><span class="w-reset">${resetCopy(w.resets_at)}</span></div>
+        ${pace?`<div class="pace-label">${esc(paceWords().official)}</div>`:''}
         <div class="w-track"><div class="w-fill" style="width:${(Math.min(w.used,1)*100).toFixed(0)}%;background:${tone(w.used)}"></div></div>
         <div class="w-used">${esc(usedCopy(w))}</div>
+        ${pace?workPaceHtml(pace):''}
+        ${creditAmountsHtml(p,w)}
       </div>`;
     }
     if(group) html+=`</div>`;
     if(snap.note) html+=`<div class="c-note">${esc(textCopy(snap.note))}</div>`;
   }
   if(offersClaudeSignIn(p)) html+=claudeAuthHtml(claudeAuth,claudeActionMessage);
-  if(p.base==='claude'){ // live sessions (a full list with jump-to-session is a follow-up)
-    const act=stateSnap.sessions.filter(s=>s.state!=='idle');
-    if(act.length){
-      html+=`<div class="c-sessions">`;
-      for(const s of act.slice(0,SESSION_ROWS)){
-        html+=`<div class="s-row"><span class="s-dot" style="background:${STATE_DOT[s.state]||'#666'}"></span>${esc(s.title)}</div>`;
-      }
-      html+=moreRow(act.length-SESSION_ROWS)+`</div>`;
-    }
-  }else{ // other providers: detected activity rows (Cursor reports state; Codex/Antigravity are inferred from recent writes)
-    // Waiting before busy, newest first within each, so what gets cut is what matters least
-    const acts=activity.filter(a=>a.provider===p.base).sort((a,b)=>(b.state==='waiting')-(a.state==='waiting')||b.since-a.since);
-    if(acts.length){
-      html+=`<div class="c-sessions">`;
-      for(const a of acts.slice(0,SESSION_ROWS)){
-        const col=a.state==='waiting'?WATCH:INK;
-        html+=`<div class="s-row"><span class="s-dot" style="background:${col}"></span>${esc(a.name)}<span style="color:#808080;margin-left:auto">${esc(textCopy(a.detail))}</span></div>`;
-      }
-      html+=moreRow(acts.length-SESSION_ROWS)+`</div>`;
-    }
-  }
+  html+=activityPrivacyHtml(p);
   c.innerHTML=html;
+  c.onclick=e=>activityPrivacyClick(e,p);
   const signIn=c.querySelector('#claude-sign-in');
   if(signIn) signIn.onclick=e=>{e.stopPropagation();signInClaude();};
   placeCard();
@@ -1438,7 +1609,7 @@ function esc(s){const d=document.createElement('div');d.textContent=s||'';return
 /* Hover: stays expanded while either the pill or the card is under the cursor; collapses after a 250 ms grace period (upstream motion rule) */
 const card=document.getElementById('card'), pill=document.getElementById('pill'), tail=document.getElementById('tail');
 let hideTimer=null;
-function showCard(){clearTimeout(hideTimer);card.classList.add('show');renderCard();armWatchdog();refreshClock();} // show first, then render: placeCard needs offsetHeight
+function showCard(){clearTimeout(hideTimer);resetActivityDetails();card.classList.add('show');renderCard();armWatchdog();refreshClock();} // show first, then render: placeCard needs offsetHeight
 // Nothing is broadcast when the Windows clock format changes, so ask again each time the card opens
 function refreshClock(){
   invoke('get_state').then(s=>{
@@ -1447,7 +1618,7 @@ function refreshClock(){
     if(card.classList.contains('show')) renderCard();
   }).catch(()=>{});
 }
-function hideCard(){card.classList.remove('show');reportHot();}
+function hideCard(){resetActivityDetails();card.innerHTML='';card.onclick=null;card.classList.remove('show');reportHot();}
 function scheduleHide(){clearTimeout(hideTimer);hideTimer=setTimeout(hideCard,250);}
 // ===== Diagnostics + geometry =====
 function jslog(m){invoke('log_js',{msg:String(m)}).catch(()=>{});}
@@ -2130,6 +2301,18 @@ listen('notch_slots',e=>{
   renderRing();
   if(card.classList.contains('show')){renderCard();armWatchdog();}
 }).catch(()=>{});
+invoke('get_provider_order').then(v=>{if(Array.isArray(v)){providerOrder=v;renderRing();}}).catch(()=>{});
+listen('provider_order',e=>{
+  if(Array.isArray(e.payload)){providerOrder=e.payload;renderRing();if(card.classList.contains('show'))renderCard();}
+}).catch(()=>{});
+invoke('get_provider_nicknames').then(v=>{
+  if(v&&typeof v==='object'){providerNicknames=v;renderRing();if(card.classList.contains('show'))renderCard();}
+}).catch(()=>{});
+listen('provider_nicknames',e=>{
+  if(e.payload&&typeof e.payload==='object'){providerNicknames=e.payload;renderRing();if(card.classList.contains('show'))renderCard();}
+}).catch(()=>{});
+invoke('get_calendar_settings').then(settings=>{workCalendar=settings||null;if(card.classList.contains('show'))renderCard();}).catch(()=>{workCalendar=null;});
+listen('work_calendar_changed',e=>{workCalendar=e.payload||null;if(card.classList.contains('show'))renderCard();}).catch(()=>{});
 invoke('get_antigravity_prefs').then(p=>{if(p){agPrefs=p;renderRing();}}).catch(()=>{});
 invoke('get_weekly_ring').then(v=>{if(typeof v==='string'){weeklyRing=v;renderRing();}}).catch(()=>{});
 listen('weekly_ring',e=>{if(typeof e.payload==='string'){weeklyRing=e.payload;renderRing();}}).catch(()=>{});

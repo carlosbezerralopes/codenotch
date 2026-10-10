@@ -11,10 +11,16 @@ O suporte Kiro usa a CLI nativa e sua sessão existente para ler `/usage`.
 Veja [pré-requisitos e comportamento](windows/README.md). A IDE sozinha não
 fornece essa integração; instalar este fork não instala nem autentica o Kiro.
 
-As atualizações Windows apontam para as releases deste fork, para preservar suas
-funcionalidades. Até publicarmos uma release Windows, a consulta pode indicar
-que não conseguiu verificar atualizações. A chave pública do updater ainda
-precisa ser configurada antes de publicar atualizações assinadas.
+O repositório foi desvinculado da rede de forks e tornado privado. A distribuição
+Windows usa downloads autenticados das releases ou dos artifacts do Actions.
+O updater anônimo não acessa releases privadas; atualizações automáticas precisam
+de um mecanismo autenticado e da chave de assinatura antes de serem habilitadas.
+
+O Windows também oferece créditos absolutos Kiro no tooltip, ordem e nomes
+personalizados, detalhes de atividade recolhidos por padrão e histórico de
+consumo com destino configurável. Os eventos e pontos de leitura são guardados
+por máquina e consolidados. Veja [telemetria](windows/docs/telemetry.md) e
+[calendário de dias úteis](windows/docs/work-calendar.md).
 
 ## Verificação
 

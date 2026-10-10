@@ -27,6 +27,27 @@ Providers that are not installed simply do not get a cell.
 
 ### Kiro
 
+The hover card preserves both the official percentage and explicitly reported
+credits used/allowed. It does not estimate credits from a rounded percentage.
+
+### Windows customization and history
+
+Accounts supports dragging or moving providers with the arrow buttons and
+renaming their displayed labels. Hiding a provider preserves its chosen order;
+turning it back on adds it to the end. Hover activity is summarized by default:
+click the card or **Show details** to reveal session information. Closing the
+card or switching tools hides those details again.
+
+**General → Usage history** opens the configurable, shared consumption history.
+First use asks for its destination and suggests Business OneDrive. Records and
+checkpoints are stored by collection machine and consolidated with deduplication.
+See [telemetry sources and recovery](docs/telemetry.md) and
+[working-day calendar](docs/work-calendar.md). The Codex weekly card can compare
+official quota with elapsed calendar time and elapsed working time; those time
+bars are derived references, not additional allowances.
+
+### Kiro CLI setup
+
 Install the [native Windows CLI](https://kiro.dev/docs/getting-started/installation/)
 and sign in with `kiro-cli login`. The official MSI installer names
 `%ProgramFiles%\Kiro-Cli` as its destination. Discovery also checks native

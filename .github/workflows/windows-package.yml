@@ -10,10 +10,8 @@ on:
     paths:
       - 'windows/**'
       - '.github/workflows/windows-package.yml'
+  # Required checks must also run on documentation-only pull requests.
   pull_request:
-    paths:
-      - 'windows/**'
-      - '.github/workflows/windows-package.yml'
   # A v* release is cut from a Mac by `make publish`. This is what puts the
   # Windows installer beside its dmg.
   release:

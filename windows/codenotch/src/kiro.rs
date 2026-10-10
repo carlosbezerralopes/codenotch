@@ -1,6 +1,6 @@
 //! Kiro CLI /usage is authoritative; GetUsageLimits only enriches its credit ceilings.
 //! Borrowed SQLite authentication is read-only and never refreshed by Codenotch.
-use crate::usage::{LimitWindow, UsageSnapshot};
+use crate::usage::{CreditAmounts, LimitWindow, UsageSnapshot};
 use crate::AppState;
 use chrono::{Datelike, Local, NaiveDate, TimeZone};
 use std::path::{Path, PathBuf};
@@ -101,7 +101,8 @@ fn number_prefix(s: &str) -> Option<f64> {
 }
 fn pair(s: &str, separator: &str) -> Option<(f64, f64)> {
     let (a, b) = s.split_once(separator)?;
-    Some((number_prefix(a)?, number_prefix(b)?))
+    let valid = |raw: &str| raw.parse::<f64>().ok().filter(|n| n.is_finite() && *n >= 0.0);
+    Some((valid(a.trim())?, valid(b.split_whitespace().next()?)?))
 }
 fn display_plan(raw: &str) -> String {
     let s = raw.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -157,7 +158,9 @@ fn parse_cli(text: &str, now: chrono::DateTime<Local>) -> Result<Reading, ReadEr
     let resets_at = clean.split_once("resets on ").and_then(|(_, s)| reset_stamp(s, now));
     let mut windows = Vec::new();
     if let Some(used) = percent.or_else(|| credits.filter(|(_, total)| *total > 0.0).map(|(used, total)| used / total)) {
-        windows.push(LimitWindow { id: "credits".into(), label: "Credits".into(), used, resets_at, ..Default::default() });
+        let amounts = credits.filter(|(_, total)| *total > 0.0)
+            .map(|(consumed, allowance)| CreditAmounts { consumed, allowance });
+        windows.push(LimitWindow { id: "credits".into(), label: "Credits".into(), used, resets_at, credits: amounts, ..Default::default() });
     }
     let bonus = clean.split_once("Bonus credits:").and_then(|(_, s)| pair(s, "/"));
     if let Some((used, total)) = bonus.filter(|(_, total)| *total > 0.0) {
@@ -165,7 +168,8 @@ fn parse_cli(text: &str, now: chrono::DateTime<Local>) -> Result<Reading, ReadEr
             .filter(|n| *n <= 36500.0)
             .and_then(|n| now.checked_add_days(chrono::Days::new(n as u64)))
             .map(|d| d.timestamp_millis().max(0) as u64);
-        windows.push(LimitWindow { id: "bonus".into(), label: "Credits".into(), group: Some("Bonus".into()), used: used / total, resets_at: expiry, ..Default::default() });
+        windows.push(LimitWindow { id: "bonus".into(), label: "Credits".into(), group: Some("Bonus".into()), used: used / total, resets_at: expiry,
+            credits: Some(CreditAmounts { consumed: used, allowance: total }), ..Default::default() });
     }
     if plan.is_none() && windows.is_empty() { return Err(ReadError::BadOutput); }
     Ok(Reading { plan, windows })
@@ -361,11 +365,13 @@ fn apply_limits(reading: &mut Reading, limits: CreditLimits) {
     if limits.plan_limit > 0.0 && !limits.bonuses {
         let old = reading.windows.iter().position(|w| w.id == "credits");
         let reset = limits.reset.or_else(|| old.and_then(|i| reading.windows[i].resets_at));
-        let w = LimitWindow { id: "credits".into(), label: "Credits".into(), used: limits.plan_used / limits.plan_limit, resets_at: reset, ..Default::default() };
+        let w = LimitWindow { id: "credits".into(), label: "Credits".into(), used: limits.plan_used / limits.plan_limit, resets_at: reset,
+            credits: Some(CreditAmounts { consumed: limits.plan_used, allowance: limits.plan_limit }), ..Default::default() };
         if let Some(i) = old { reading.windows[i] = w; } else { reading.windows.insert(0, w); }
     }
     if let Some(cap) = limits.overage_cap.filter(|c| *c > 0.0) {
-        reading.windows.push(LimitWindow { id: "overage".into(), label: "Overage".into(), used: limits.overage_used / cap, resets_at: limits.reset, ..Default::default() });
+        reading.windows.push(LimitWindow { id: "overage".into(), label: "Overage".into(), used: limits.overage_used / cap, resets_at: limits.reset,
+            credits: Some(CreditAmounts { consumed: limits.overage_used, allowance: cap }), ..Default::default() });
     }
 }
 
@@ -486,8 +492,12 @@ mod tests {
         assert_eq!(r.windows.len(), 2);
         assert_eq!(r.windows[0].id, "credits");
         assert_eq!(r.windows[0].used, 0.0);
+        assert_eq!(r.windows[0].credits.as_ref().unwrap().consumed, 0.17);
+        assert_eq!(r.windows[0].credits.as_ref().unwrap().allowance, 50.0);
         assert_eq!(r.windows[1].group.as_deref(), Some("Bonus"));
         assert!((r.windows[1].used - 45.53 / 2000.0).abs() < 0.000001);
+        assert_eq!(r.windows[1].credits.as_ref().unwrap().consumed, 45.53);
+        assert_eq!(r.windows[1].credits.as_ref().unwrap().allowance, 2000.0);
         assert!(r.windows[1].resets_at.is_some());
         assert!(!r.windows.iter().any(|w| w.id == "weekly"));
         assert_eq!(strip_ansi("\x1b]8;;https://kiro.dev\x07hello\x1b]8;;\x1b\\\x1b(Bliteral"), "helloliteral");
@@ -551,10 +561,37 @@ mod tests {
         assert_eq!(r.windows[0].used, 1.0);
         assert_eq!(r.windows[1].used, 0.5);
         assert_eq!(r.windows[2].used, 0.00025);
+        assert_eq!(r.windows[0].credits.as_ref().unwrap().consumed, 3000.0);
+        assert_eq!(r.windows[0].credits.as_ref().unwrap().allowance, 3000.0);
+        assert_eq!(r.windows[1].credits.as_ref().unwrap().consumed, 5.0);
+        assert_eq!(r.windows[2].credits.as_ref().unwrap().consumed, 0.25);
+        assert_eq!(r.windows[2].credits.as_ref().unwrap().allowance, 1000.0);
         let mut v = limits(); v["usageBreakdownList"][0]["bonuses"] = json!([{}]);
-        let mut r = fixture("Plan: KIRO POWER\n████ 80%");
+        let mut r = fixture("Plan: KIRO POWER\n████ 80%\n(0.17 of 50 covered in plan)");
         apply_limits(&mut r, parse_limits(&v).unwrap());
         assert_eq!(r.windows[0].used, 0.8, "unseparated API bonus cannot replace CLI credits");
+        assert_eq!(r.windows[0].credits.as_ref().unwrap().consumed, 0.17);
+        assert_eq!(r.windows[0].credits.as_ref().unwrap().allowance, 50.0);
+    }
+
+    #[test]
+    fn credit_amounts_require_an_explicit_valid_pair_and_survive_cache_roundtrip() {
+        for text in ["Plan: KIRO FREE\n████ 0%", "Plan: KIRO FREE\n████ 25%\n(no data covered in plan)",
+            "Plan: KIRO FREE\n████ 25%\n(0.17junk of 50 covered in plan)",
+            "Plan: KIRO FREE\n████ 25%\n(-1 of 50 covered in plan)",
+            "Plan: KIRO FREE\n████ 25%\n(0.17 of 0 covered in plan)"] {
+            assert!(fixture(text).windows[0].credits.is_none());
+        }
+        let old = json!({"id":"credits","label":"Credits","used":0.25,"resets_at":null});
+        let window: LimitWindow = serde_json::from_value(old).unwrap();
+        assert!(window.credits.is_none());
+        assert!(serde_json::to_value(window).unwrap().get("credits").is_none());
+        let reading = fixture("Plan: KIRO FREE\n████ 0%\n(0.17 of 50 covered in plan)");
+        let restored: LimitWindow = serde_json::from_value(serde_json::to_value(&reading.windows[0]).unwrap()).unwrap();
+        assert_eq!(restored.used, 0.0);
+        assert_eq!(restored.credits.unwrap().consumed, 0.17);
+        let zero = fixture("Plan: KIRO FREE\n(0.00 of 50 covered in plan)");
+        assert_eq!(zero.windows[0].credits.as_ref().unwrap().consumed, 0.0);
     }
 
     #[test]

@@ -81,12 +81,23 @@
   .item > .seg{margin-left:auto}
   .item.cap{min-height:0;padding:8px 12px;font-size:12px;color:var(--text2);display:block}
   .item .hint{font-size:12px;color:var(--text2)}
+  .item > input:not(.range){max-width:190px;min-width:0;background:var(--seg-bg);color:var(--text);border:1px solid var(--line);border-radius:5px;padding:4px 6px;font:inherit}
   .value{color:var(--text2)}
 
   /* ---- account rows ---- */
   .acct{padding:9px 12px}
   .acct-line{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:24px}
   .acct-name{display:flex;align-items:center;gap:10px;min-width:0}
+  .acct-name > span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .acct-tools{display:flex;align-items:center;gap:5px;flex:none}
+  .acct-tools button,.acct-grip{border:0;background:transparent;color:var(--text2);padding:3px 5px;border-radius:4px}
+  .acct-tools button:hover,.acct-grip:hover{background:var(--seg-bg);color:var(--text)}
+  .acct-grip{cursor:grab;font-size:16px}
+  .acct-grip:active{cursor:grabbing}
+  .acct-tools button:disabled{opacity:.35}
+  .acct-edit{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:8px}
+  .acct-edit input{min-width:80px;flex:1;background:var(--seg-bg);color:var(--text);border:1px solid var(--line);border-radius:5px;padding:4px 6px;font:inherit}
+  .acct-edit .hint{width:100%;font-size:12px;color:var(--text2)}
   .acct.off .acct-name{color:var(--text2)}
   .acct.off .glyph{opacity:.5}
   .acct-detail{margin:4px 0 0 26px;font-size:12px;color:var(--text2)}
@@ -186,6 +197,24 @@
           <div class="item cap" id="cap-limits" data-dynamic hidden></div>
           <div class="item"><span></span><button class="btn" id="btn-reset-limits">Reset to defaults</button></div>
         </div>
+        <div class="sec">Work calendar</div>
+        <div class="group" id="calendar-settings">
+          <div class="item"><label for="calendar-country">Country code</label><input id="calendar-country" maxlength="2" value="BR" size="4"></div>
+          <div class="item"><label for="calendar-state">State or region</label><input id="calendar-state" maxlength="16" value="CE" size="10"></div>
+          <div class="item"><label for="calendar-city">City</label><input id="calendar-city" maxlength="120" value="Fortaleza" size="20"></div>
+          <div class="item"><label for="calendar-offset">UTC offset (minutes)</label><input id="calendar-offset" type="number" min="-720" max="840" step="1" value="-180"></div>
+          <div class="item cap">The offset is fixed. Brazil and Fortaleza/CE holidays are built in; other cities need their local nonworking dates. Optional public-sector days are not added automatically.</div>
+          <div class="item"><span>Location suggestion</span><button class="btn" id="calendar-detect">Locate by IP (ipapi.co)</button></div>
+          <div class="item cap">Only this button contacts ipapi.co with your public IP. Review the suggestion and save to apply it.</div>
+          <div class="item cap" id="calendar-coverage" data-dynamic></div>
+          <div class="item"><label for="calendar-date">Custom date</label><input type="date" id="calendar-date"></div>
+          <div class="item"><label for="calendar-date-name">Date name</label><input id="calendar-date-name" maxlength="80" size="20"></div>
+          <div class="item"><label for="calendar-date-mode">Day type</label><select id="calendar-date-mode"><option value="true">Nonworking</option><option value="false">Working (holiday override)</option></select><button class="btn" id="calendar-add">Add date</button></div>
+          <div id="calendar-dates" data-dynamic></div>
+          <div class="item cap">Saturday and Sunday remain extra days: their spending counts in the official quota, but they do not advance business time. A working override removes a holiday on a weekday.</div>
+          <div class="item"><span></span><span><button class="btn" id="calendar-cancel">Cancel edits</button> <button class="btn" id="calendar-save">Save calendar</button></span></div>
+          <div class="item cap" id="calendar-status" role="status" data-dynamic></div>
+        </div>
         <div class="sec">App</div>
         <div class="group">
           <div class="item"><span>App icon</span><span class="seg" id="seg-tray"><button data-v="tray">System tray</button><button data-v="none">Neither</button></span></div>
@@ -217,6 +246,10 @@
           <div class="item cap">Codenotch checks for new Windows releases shortly after it starts. Signed updates install here; otherwise download and run the official installer from GitHub.</div>
         </div>
         <div class="sec">Notifications</div>
+        <div class="group">
+          <div class="item"><span>Usage history</span><button class="btn" id="btn-telemetry">Open history</button></div>
+          <div class="item cap">Choose the telemetry folder, consolidate your machines, and review consumption by date, project and folder.</div>
+        </div>
         <div class="group">
           <div class="item"><span>Reset notifications</span><button class="switch" id="sw-reset-alert" role="switch" aria-checked="false" aria-label="Reset notifications"></button></div>
           <div class="item cap">Show a card when Claude, Codex, Cursor or another active provider renews a window after at least 10% use. The card also appears while the notch is hidden.</div>
@@ -305,6 +338,45 @@ const PT_BR_STATIC = {
   'These have no ring to place. Switch one on and it joins the end of the list above.':'Estes não têm anel para posicionar. Ative um e ele entra no fim da lista acima.',
   'One provider always stays ticked, so the pill is never empty.':'Pelo menos um provedor permanece selecionado para que a cápsula nunca fique vazia.',
   'At least one provider stays on the notch':'Pelo menos um provedor deve permanecer no notch',
+  'Usage history':'Histórico de consumo',
+  'Open history':'Abrir histórico',
+  'Choose the telemetry folder, consolidate your machines, and review consumption by date, project and folder.':'Escolha a pasta da telemetria, consolide suas máquinas e consulte o consumo por data, projeto e pasta.',
+  'Work calendar':'Calendário de trabalho',
+  'Country code':'Código do país',
+  'State or region':'Estado ou região',
+  'City':'Cidade',
+  'UTC offset (minutes)':'Deslocamento UTC (minutos)',
+  'The offset is fixed. Brazil and Fortaleza/CE holidays are built in; other cities need their local nonworking dates. Optional public-sector days are not added automatically.':'O deslocamento é fixo. Feriados do Brasil e de Fortaleza/CE estão incluídos; outras cidades precisam das suas datas locais sem trabalho. Pontos facultativos do setor público não entram automaticamente.',
+  'Location suggestion':'Sugestão de localização',
+  'Locate by IP (ipapi.co)':'Localizar por IP (ipapi.co)',
+  'Only this button contacts ipapi.co with your public IP. Review the suggestion and save to apply it.':'Somente este botão consulta o ipapi.co usando seu IP público. Revise a sugestão e salve para aplicá-la.',
+  'Custom date':'Data personalizada',
+  'Date name':'Nome da data',
+  'Day type':'Tipo de dia',
+  'Nonworking':'Sem trabalho',
+  'Working (holiday override)':'Com trabalho (substitui feriado)',
+  'Add date':'Adicionar data',
+  'Remove date':'Remover data',
+  'Saturday and Sunday remain extra days: their spending counts in the official quota, but they do not advance business time. A working override removes a holiday on a weekday.':'Sábado e domingo continuam extras: o consumo conta na cota oficial, mas não avança o tempo útil. Uma data com trabalho substitui um feriado em dia de semana.',
+  'Cancel edits':'Cancelar alterações',
+  'Save calendar':'Salvar calendário',
+  'Brazil, Ceará and Fortaleza recurring holidays; exceptional dates are year-specific.':'Feriados recorrentes do Brasil, Ceará e Fortaleza; datas excepcionais valem apenas no ano indicado.',
+  'Local holidays are not confirmed. The calendar uses the known national/state dates and your custom dates.':'Feriados locais não confirmados. O calendário usa as datas nacionais/estaduais conhecidas e suas datas personalizadas.',
+  'Review the location and save to apply the calendar.':'Revise a localização e salve para aplicar o calendário.',
+  'Location suggestion received. Review and save to apply.':'Sugestão de localização recebida. Revise e salve para aplicar.',
+  'Calendar saved':'Calendário salvo',
+  'Invalid location, UTC offset or custom date.':'Localização, deslocamento UTC ou data personalizada inválidos.',
+  'Drag to reorder':'Arraste para reordenar',
+  'Move up':'Mover para cima',
+  'Move down':'Mover para baixo',
+  'Name this provider':'Renomear provedor',
+  'Name':'Nome',
+  'Save name':'Salvar nome',
+  'Cancel':'Cancelar',
+  'Empty restores the original name.':'Vazio restaura o nome original.',
+  'The notch draws these in this order. Drag a handle or use the arrows to move one.':'O notch exibe os provedores nesta ordem. Arraste a alça ou use as setas para mover um.',
+  'One provider stays selected. An unavailable provider has no ring until it returns.':'Um provedor permanece selecionado. Um provedor indisponível só terá anel quando retornar.',
+  'Names can contain at most 60 characters and no control characters.':'O nome aceita até 60 caracteres e nenhum caractere de controle.',
   'Notch reads':'Leitura do notch',
   'Model data':'Dados do modelo',
   'Automatic':'Automático',
@@ -1226,6 +1298,107 @@ document.getElementById('btn-reset-preview').addEventListener('click', async e =
   catch(err) { strip('Preview card failed: ' + errText(err)); }
   finally { button.disabled = false; }
 });
+document.getElementById('btn-telemetry').addEventListener('click', () => invoke('open_telemetry').catch(e => strip(errText(e))));
+
+// BEGIN TESTABLE CALENDAR FORM
+function validCalendarDraft(draft){
+  const text=value=>typeof value==='string'&&value.trim().length>0&&!/[\u0000-\u001f\u007f-\u009f]/.test(value);
+  if(!draft||!text(draft.country)||!/^[A-Za-z]{2}$/.test(draft.country.trim())||!text(draft.state)
+    ||!/^[-A-Za-z0-9]{1,16}$/.test(draft.state.trim())||!text(draft.city)||Array.from(draft.city.trim()).length>120
+    ||!Number.isInteger(draft.utc_offset_minutes)||draft.utc_offset_minutes< -720||draft.utc_offset_minutes>840
+    ||!Array.isArray(draft.overrides)||draft.overrides.length>512) return false;
+  if(draft.country.trim().toUpperCase()==='BR'&&!['AC','AL','AP','AM','BA','CE','DF','ES','GO','MA','MT','MS','MG','PA','PB','PR','PE','PI','RJ','RN','RS','RO','RR','SC','SP','SE','TO'].includes(draft.state.trim().toUpperCase())) return false;
+  const dates=new Set();
+  for(const day of draft.overrides){
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(day.date)||!text(day.name)||Array.from(day.name.trim()).length>80||typeof day.nonworking!=='boolean'||dates.has(day.date)) return false;
+    const parsed=new Date(day.date+'T00:00:00Z');
+    if(!Number.isFinite(parsed.getTime())||parsed.toISOString().slice(0,10)!==day.date) return false;
+    dates.add(day.date);
+  }
+  return true;
+}
+function suggestedCalendar(draft,location){
+  const next={...draft,country:location.country,state:location.state,city:location.city,utc_offset_minutes:location.utc_offset_minutes};
+  if(!validCalendarDraft(next)) throw new Error('Invalid location, UTC offset or custom date.');
+  return next;
+}
+function calendarInputs(settings){
+  return {country:settings.country,state:settings.state,city:settings.city,utc_offset_minutes:settings.utc_offset_minutes,
+    include_optional_days:false,overrides:(settings.overrides||[]).map(day=>({...day}))};
+}
+function defaultCalendarInputs(){
+  return {country:'BR',state:'CE',city:'Fortaleza',utc_offset_minutes:-180,include_optional_days:false,overrides:[]};
+}
+// END TESTABLE CALENDAR FORM
+let calendarSettings=null,calendarDraft=defaultCalendarInputs();
+let calendarBusy=false,calendarOperation='',calendarVersion=0,calendarDirty=false,calendarReady=false,calendarMessage='';
+const calendarFields=[['country','calendar-country'],['state','calendar-state'],['city','calendar-city'],['utc_offset_minutes','calendar-offset']];
+function renderCalendar(){
+  for(const [key,id] of calendarFields){document.getElementById(id).value=calendarDraft[key];document.getElementById(id).disabled=calendarBusy||!calendarReady;}
+  for(const id of ['calendar-detect','calendar-save','calendar-add']) document.getElementById(id).disabled=calendarBusy||!calendarReady;
+  document.getElementById('calendar-cancel').disabled=calendarOperation==='save';
+  document.getElementById('calendar-dates').innerHTML=calendarDraft.overrides.map(day=>'<div class="item"><span>'+esc(day.date+' · '+day.name+' · '+ui(day.nonworking?'Nonworking':'Working (holiday override)',day.nonworking?'Nonworking':'Working (holiday override)'))+'</span><button class="btn" data-calendar-remove="'+esc(day.date)+'"'+(calendarBusy?' disabled':'')+' aria-label="'+esc(ui('Remove date','Remove date')+': '+day.date)+'">×</button></div>').join('');
+  const coverage=calendarSettings?.source_coverage;
+  const label=calendarDirty||!coverage?'Review the location and save to apply the calendar.':coverage.municipal?'Brazil, Ceará and Fortaleza recurring holidays; exceptional dates are year-specific.':'Local holidays are not confirmed. The calendar uses the known national/state dates and your custom dates.';
+  document.getElementById('calendar-coverage').textContent=ui(label,label);
+  document.getElementById('calendar-status').textContent=ui(calendarMessage,calendarMessage);
+}
+function cancelCalendarEdits(){
+  if(calendarOperation==='save') return;
+  calendarVersion++;
+  calendarBusy=false;calendarOperation='';calendarDirty=false;calendarMessage='';
+  calendarDraft=calendarSettings?calendarInputs(calendarSettings):defaultCalendarInputs();
+  renderCalendar();
+}
+async function loadCalendarSettings(){
+  try{
+    const settings=await invoke('get_calendar_settings');
+    if(!settings||!validCalendarDraft(calendarInputs(settings))) throw new Error('Invalid calendar settings response');
+    calendarSettings=settings;
+    if(!calendarDirty) calendarDraft=calendarInputs(settings);
+  }catch(error){calendarMessage=errText(error);}
+  finally{calendarReady=true;renderCalendar();}
+}
+async function detectCalendarSettings(){
+  if(calendarBusy) return;
+  const version=++calendarVersion;
+  calendarBusy=true;calendarOperation='detect';calendarMessage='';renderCalendar();
+  try{
+    const location=await invoke('detect_calendar_location');
+    if(version!==calendarVersion) return;
+    calendarDraft=suggestedCalendar(calendarDraft,location);calendarDirty=true;
+    calendarMessage='Location suggestion received. Review and save to apply.';
+  }catch(error){if(version===calendarVersion) calendarMessage=errText(error);}
+  finally{if(version===calendarVersion){calendarBusy=false;calendarOperation='';renderCalendar();}}
+}
+async function saveCalendarSettings(){
+  if(calendarBusy) return;
+  if(!validCalendarDraft(calendarDraft)){calendarMessage='Invalid location, UTC offset or custom date.';renderCalendar();return;}
+  const version=++calendarVersion;
+  calendarBusy=true;calendarOperation='save';calendarMessage='';renderCalendar();
+  try{
+    const settings=await invoke('set_calendar_settings',{settings:calendarInputs(calendarDraft)});
+    if(version!==calendarVersion) return;
+    if(!settings||!validCalendarDraft(calendarInputs(settings))) throw new Error('Invalid calendar settings response');
+    calendarSettings=settings;calendarDraft=calendarInputs(settings);calendarDirty=false;calendarMessage='Calendar saved';
+  }catch(error){if(version===calendarVersion) calendarMessage=errText(error);}
+  finally{if(version===calendarVersion){calendarBusy=false;calendarOperation='';renderCalendar();}}
+}
+for(const [key,id] of calendarFields) document.getElementById(id).addEventListener('input',e=>{calendarDraft[key]=key==='utc_offset_minutes'?(e.target.value.trim()===''?NaN:Number(e.target.value)):e.target.value;calendarDirty=true;});
+document.getElementById('calendar-cancel').addEventListener('click',cancelCalendarEdits);
+document.getElementById('calendar-detect').addEventListener('click',detectCalendarSettings);
+document.getElementById('calendar-save').addEventListener('click',saveCalendarSettings);
+document.getElementById('calendar-add').addEventListener('click',()=>{
+  if(calendarBusy) return;
+  const day={date:document.getElementById('calendar-date').value,name:document.getElementById('calendar-date-name').value,nonworking:document.getElementById('calendar-date-mode').value==='true'};
+  const next={...calendarDraft,overrides:[...calendarDraft.overrides.filter(entry=>entry.date!==day.date),day]};
+  if(!validCalendarDraft(next)){calendarMessage='Invalid location, UTC offset or custom date.';renderCalendar();return;}
+  calendarDraft=next;calendarDirty=true;calendarMessage='';renderCalendar();
+});
+document.getElementById('calendar-dates').addEventListener('click',e=>{
+  const remove=e.target.closest('[data-calendar-remove]');
+  if(remove&&!calendarBusy){calendarDraft.overrides=calendarDraft.overrides.filter(day=>day.date!==remove.dataset.calendarRemove);calendarDirty=true;renderCalendar();}
+});
 try { window.__TAURI__.event.listen('reset_alert_preview_error', e => strip('Preview card failed: ' + errText(e.payload))); } catch(e) { /* invoke failure uses the strip */ }
 const adaptivePill = remote('get_adaptive_pill', 'set_adaptive_pill', 'Adaptive pill', () => drawSwitch(document.getElementById('sw-adaptive'), adaptivePill));
 document.getElementById('sw-adaptive').addEventListener('click', () => adaptivePill.toggle());
@@ -1237,30 +1410,61 @@ document.getElementById('sw-weekly-dashed').addEventListener('click', () => week
    later version turns up by itself. At least one always stays on: saving an empty list would
    switch every provider back on, the opposite of what the click asked for. */
 let notchSlots = [];
+let providerOrder = [], providerNicknames = {};
+let accountsBusy = false, editingName = null, nameDraft = '', draggedProvider = null;
 const AG_LIMITS = [['automatic', 'Automatic'], ['5h', '5-Hour Limit'], ['weekly', 'Weekly Limit']];
 const AG_MODELS = [['gemini', 'Gemini Models'], ['3p', 'Claude and GPT models']];
 let agPrefs = { limit:'automatic', model:'gemini' };
 const HOOKS_WHY = 'Turning this on adds a few lines to your Claude Code settings file so that Claude Code sends Codenotch a short message when a session starts, when it is working, when it is waiting for your answer, and when it finishes. That is what makes the ring spin and the amber ring pulse.';
-const ONE_STAYS = 'One provider always stays ticked, so the pill is never empty.';
+const ONE_STAYS = 'One provider stays selected. An unavailable provider has no ring until it returns.';
+const ORDER_WHY = 'The notch draws these in this order. Drag a handle or use the arrows to move one.';
 const NO_RING = 'These have no ring to place. Switch one on and it joins the end of the list above.';
 
 function notchOn(){
   const ids = providerList().map(p => p.id);
   if(!notchSlots.length) return ids.map(id => ({ provider:id }));
-  const on = notchSlots.filter(sl => sl && ids.indexOf(sl.provider) >= 0);
-  return on.length ? on : ids.map(id => ({ provider:id }));
+  return notchSlots.filter((sl, i, slots) => sl && typeof sl.provider === 'string'
+    && slots.findIndex(other => other && other.provider === sl.provider) === i);
 }
+// BEGIN TESTABLE PROVIDER PRESENTATION
+function arrangeProviders(list, order){
+  const positions = new Map(order.map((id, i) => [id, i]));
+  return list.slice().sort((a, b) => (positions.get(a.id) ?? Infinity) - (positions.get(b.id) ?? Infinity));
+}
+function providerName(p){
+  return providerNicknames[p.id] || FALLBACK_LABEL[p.id] || p.label || p.id;
+}
+function joinedOrder(id){
+  const on = new Set(notchOn().map(sl => sl.provider));
+  const current = arrangeProviders(providerList(), providerOrder).map(p => p.id).filter(p => p !== id);
+  const last = current.reduce((at, p, i) => on.has(p) ? i : at, -1);
+  current.splice(last + 1, 0, id);
+  return current;
+}
+// END TESTABLE PROVIDER PRESENTATION
 function agSelect(key, choices, value){
   return '<select data-ag="' + key + '">'
     + choices.map(([v, t]) => '<option value="' + v + '"' + (v === value ? ' selected' : '') + '>' + esc(ui(t, t)) + '</option>').join('')
     + '</select>';
 }
-function accountBlock(p, isOn, locked){
+function accountBlock(p, isOn, locked, index, count){
   const st = statusText(p);
-  let h = '<div class="acct' + (isOn ? '' : ' off') + '">'
-    + '<div class="acct-line"><span class="acct-name">' + glyphHtml(p) + '<span>' + esc(p.label || p.id) + '</span></span>'
+  const name = providerName(p), busy = accountsBusy ? ' disabled' : '';
+  let h = '<div class="acct' + (isOn ? '' : ' off') + '" data-provider="' + esc(p.id) + '">'
+    + '<div class="acct-line"><span class="acct-name">'
+    + (isOn ? '<button class="acct-grip" draggable="' + !accountsBusy + '" data-drag="' + esc(p.id) + '" title="' + esc(ui('Drag to reorder', 'Drag to reorder')) + '" aria-label="' + esc(ui('Drag to reorder', 'Drag to reorder') + ': ' + name) + '"' + busy + '>⠿</button>' : '')
+    + glyphHtml(p) + '<span title="' + esc(name) + '">' + esc(name) + '</span></span><span class="acct-tools">'
+    + (isOn ? '<button data-move="-1" data-id="' + esc(p.id) + '" aria-label="' + esc(ui('Move up', 'Move up') + ': ' + name) + '"' + (accountsBusy || index === 0 ? ' disabled' : '') + '>↑</button>'
+      + '<button data-move="1" data-id="' + esc(p.id) + '" aria-label="' + esc(ui('Move down', 'Move down') + ': ' + name) + '"' + (accountsBusy || index === count - 1 ? ' disabled' : '') + '>↓</button>' : '')
+    + '<button data-rename="' + esc(p.id) + '" aria-label="' + esc(ui('Name this provider', 'Name this provider') + ': ' + name) + '"' + busy + '>✎</button>'
     + '<button class="switch' + (isOn ? ' on' : '') + (locked ? ' locked' : '') + '" role="switch" aria-checked="' + isOn + '"'
-    + ' data-np="' + esc(p.id) + '" aria-label="' + esc(p.label || p.id) + '"></button></div>';
+    + ' data-np="' + esc(p.id) + '" aria-label="' + esc(name) + '"' + busy + '></button></span></div>';
+  if(editingName === p.id){
+    h += '<form class="acct-edit" data-name-form="' + esc(p.id) + '"><input data-name-input maxlength="60" aria-label="' + esc(ui('Name', 'Name')) + '" value="' + esc(nameDraft) + '" placeholder="' + esc(FALLBACK_LABEL[p.id] || p.label) + '"' + busy + '>'
+      + '<button class="btn" type="submit"' + busy + '>' + esc(ui('Save name', 'Save name')) + '</button>'
+      + '<button class="btn" type="button" data-cancel-name' + busy + '>' + esc(ui('Cancel', 'Cancel')) + '</button>'
+      + '<span class="hint">' + esc(ui('Empty restores the original name.', 'Empty restores the original name.')) + '</span></form>';
+  }
   if(st) h += '<div class="acct-detail">' + esc(st) + '</div>';
   if(p.id === 'gemini' && isOn){
     h += '<div class="acct-sub"><span>' + esc(ui('Notch reads', 'Notch reads')) + '</span>' + agSelect('limit', AG_LIMITS, agPrefs.limit) + '</div>'
@@ -1275,25 +1479,36 @@ function accountBlock(p, isOn, locked){
   return h + '</div>';
 }
 function renderAccounts(){
-  const list = providerList();
+  const list = arrangeProviders(providerList(), providerOrder);
   const onIds = notchOn().map(sl => sl.provider);
   const connected = list.filter(p => onIds.indexOf(p.id) >= 0);
   const off = list.filter(p => onIds.indexOf(p.id) < 0);
-  document.getElementById('acc-on').innerHTML = connected.map(p => accountBlock(p, true, connected.length === 1)).join('')
+  document.getElementById('acc-on').innerHTML = connected.map((p, i) => accountBlock(p, true, notchOn().length === 1, i, connected.length)).join('')
+    + (connected.length ? '<div class="item cap">' + esc(ui(ORDER_WHY, ORDER_WHY)) + '</div>' : '')
     + '<div class="item cap">' + esc(ui(ONE_STAYS, ONE_STAYS)) + '</div>';
   document.getElementById('acc-off-wrap').hidden = !off.length;
   document.getElementById('acc-off').innerHTML = off.map(p => accountBlock(p, false, false)).join('')
     + '<div class="item cap">' + esc(ui(NO_RING, NO_RING)) + '</div>';
 }
-function saveNotch(next){
+async function writeProviderOrder(order){
+  const saved = await invoke('set_provider_order', { order });
+  if(!Array.isArray(saved)) throw new Error('Invalid provider order response');
+  providerOrder = saved;
+}
+async function saveNotch(next, rejoined){
+  if(accountsBusy) return;
   const ids = providerList().map(p => p.id);
-  const store = next.length === ids.length ? [] : next;
-  const prev = notchSlots;
-  notchSlots = store;
+  const store = ids.every(id => next.some(sl => sl.provider === id)) && next.every(sl => ids.includes(sl.provider)) ? [] : next;
+  accountsBusy = true;
   renderAccounts();
-  invoke('set_notch_slots', { slots: store.map(sl => ({ provider:sl.provider })) })
-    .then(() => toast())
-    .catch(e => { notchSlots = prev; renderAccounts(); strip('set_notch_slots failed: ' + errText(e)); });
+  try {
+    if(rejoined) await writeProviderOrder(joinedOrder(rejoined));
+    const saved = await invoke('set_notch_slots', { slots: store.map(sl => ({ provider:sl.provider })) });
+    if(!Array.isArray(saved)) throw new Error('Invalid notch selection response');
+    notchSlots = saved;
+    toast();
+  } catch(e) { strip('Notch settings could not be saved: ' + errText(e)); }
+  finally { accountsBusy = false; renderAccounts(); }
 }
 function toggleNotch(id){
   const ids = providerList().map(p => p.id);
@@ -1306,15 +1521,85 @@ function toggleNotch(id){
   } else {
     on.push({ provider:id });
   }
-  on.sort((a, b) => ids.indexOf(a.provider) - ids.indexOf(b.provider));
-  saveNotch(on);
+  saveNotch(on, at < 0 ? id : null);
+}
+async function moveProvider(id, target){
+  if(accountsBusy) return;
+  const onIds = new Set(notchOn().map(sl => sl.provider));
+  const order = arrangeProviders(providerList(), providerOrder).map(p => p.id);
+  const from = order.indexOf(id), to = order.indexOf(target);
+  if(from < 0 || to < 0 || from === to || !onIds.has(id) || !onIds.has(target)) return;
+  order.splice(to, 0, order.splice(from, 1)[0]);
+  accountsBusy = true;
+  renderAccounts();
+  try { await writeProviderOrder(order); toast(); }
+  catch(e) { strip('Provider order could not be saved: ' + errText(e)); }
+  finally { accountsBusy = false; renderAccounts(); }
+}
+async function saveProviderName(id, name){
+  if(accountsBusy) return;
+  const invalid = /[\u0000-\u001f\u007f-\u009f]/.test(name) || Array.from(name.trim()).length > 60;
+  if(invalid){ strip(ui('Names can contain at most 60 characters and no control characters.', 'Names can contain at most 60 characters and no control characters.')); return; }
+  accountsBusy = true;
+  renderAccounts();
+  try {
+    const names = await invoke('set_provider_nickname', { provider:id, name });
+    if(!names || typeof names !== 'object' || Array.isArray(names)) throw new Error('Invalid provider names response');
+    providerNicknames = names;
+    editingName = null;
+    toast();
+  } catch(e) { strip('Provider name could not be saved: ' + errText(e)); }
+  finally { accountsBusy = false; renderAccounts(); }
 }
 const accountsPane = document.getElementById('pane-accounts');
 accountsPane.addEventListener('click', e => {
+  if(accountsBusy) return;
+  const rename = e.target.closest('[data-rename]');
+  if(rename){
+    editingName = rename.dataset.rename;
+    nameDraft = providerNicknames[editingName] || '';
+    renderAccounts();
+    const input = accountsPane.querySelector('[data-name-input]');
+    if(input){ input.focus(); input.select(); }
+    return;
+  }
+  if(e.target.closest('[data-cancel-name]')){ editingName = null; renderAccounts(); return; }
+  const move = e.target.closest('[data-move]');
+  if(move){
+    const on = new Set(notchOn().map(sl => sl.provider));
+    const ids = arrangeProviders(providerList(), providerOrder).filter(p => on.has(p.id)).map(p => p.id);
+    const target = ids[ids.indexOf(move.dataset.id) + Number(move.dataset.move)];
+    if(target) moveProvider(move.dataset.id, target);
+    return;
+  }
   const np = e.target.closest('[data-np]');
   if(np){ toggleNotch(np.dataset.np); return; }
   if(e.target.closest('[data-remote="hooks"]')) hooks.toggle();
 });
+accountsPane.addEventListener('input', e => { if(e.target.matches('[data-name-input]')) nameDraft = e.target.value; });
+accountsPane.addEventListener('submit', e => {
+  const form = e.target.closest('[data-name-form]');
+  if(form){ e.preventDefault(); saveProviderName(form.dataset.nameForm, nameDraft); }
+});
+accountsPane.addEventListener('keydown', e => {
+  if(e.key === 'Escape' && editingName && !accountsBusy){ editingName = null; renderAccounts(); }
+});
+accountsPane.addEventListener('dragstart', e => {
+  const grip = e.target.closest('[data-drag]');
+  if(!grip || accountsBusy){ e.preventDefault(); return; }
+  draggedProvider = grip.dataset.drag;
+  e.dataTransfer.setData('text/plain', draggedProvider);
+  e.dataTransfer.effectAllowed = 'move';
+});
+accountsPane.addEventListener('dragover', e => {
+  if(draggedProvider && !accountsBusy && e.target.closest('#acc-on [data-provider]')){ e.preventDefault(); e.dataTransfer.dropEffect = 'move'; }
+});
+accountsPane.addEventListener('drop', e => {
+  const row = e.target.closest('#acc-on [data-provider]');
+  if(row && draggedProvider){ e.preventDefault(); moveProvider(draggedProvider, row.dataset.provider); }
+  draggedProvider = null;
+});
+accountsPane.addEventListener('dragend', () => { draggedProvider = null; });
 accountsPane.addEventListener('change', e => {
   const box = e.target.closest('[data-ag]');
   if(!box) return;
@@ -1729,6 +2014,7 @@ Promise.resolve(updateListener).catch(() => {}).then(() =>
 
 /* ---- start ---------------------------------------------------------------- */
 function renderAll(){
+  renderCalendar();
   renderAccounts();
   renderFlags();
   renderSize();
@@ -1749,12 +2035,15 @@ function boot(){
   showTab(savedTab());
   setUiLanguage('auto');
   const first = [
+    loadCalendarSettings(),
     loadLook(),
     refreshOptions(),
     call('get_notch_slots', undefined, []).then(v => {
       notchSlots = Array.isArray(v) ? v.filter(x => x && typeof x.provider === 'string').map(x => ({ provider:x.provider })) : [];
       renderAccounts();
     }),
+    call('get_provider_order', undefined, []).then(v => { if(Array.isArray(v)) providerOrder = v; renderAccounts(); }),
+    call('get_provider_nicknames', undefined, {}).then(v => { if(v && typeof v === 'object') providerNicknames = v; renderAccounts(); }),
     call('get_antigravity_prefs', undefined, null).then(v => { if(v && typeof v === 'object'){ agPrefs = v; renderAccounts(); } }),
     call('get_glyphs', undefined, null).then(g => { if(g && typeof g === 'object'){ glyphs = g; renderAccounts(); } }),
     call('get_scale', undefined, null).then(v => { if(typeof v === 'number') notchSize = v; renderSize(); }),
@@ -1782,6 +2071,14 @@ function boot(){
     hooks.refresh()
   ];
   try { window.__TAURI__.event.listen('glyphs', e => { if(e.payload){ glyphs = e.payload; renderAccounts(); } }); } catch(e) { /* the letters stay */ }
+  try {
+    window.__TAURI__.event.listen('work_calendar_changed',e=>{
+      if(e.payload&&validCalendarDraft(calendarInputs(e.payload))){calendarSettings=e.payload;if(!calendarDirty) calendarDraft=calendarInputs(e.payload);renderCalendar();}
+    });
+    window.__TAURI__.event.listen('provider_order', e => { if(Array.isArray(e.payload)){ providerOrder = e.payload; renderAccounts(); } });
+    window.__TAURI__.event.listen('provider_nicknames', e => { if(e.payload && typeof e.payload === 'object'){ providerNicknames = e.payload; renderAccounts(); } });
+    window.__TAURI__.event.listen('notch_slots', e => { if(Array.isArray(e.payload)){ notchSlots = e.payload; renderAccounts(); } });
+  } catch(e) { strip('Provider presentation events unavailable: ' + errText(e)); }
   // The window stays hidden until this first state is drawn (settings_window.rs), so it opens already
   // translated and with every switch where it belongs. A read that hangs holds it back 1.5 s at most.
   Promise.race([Promise.allSettled(first), new Promise(r => setTimeout(r, 1500))])

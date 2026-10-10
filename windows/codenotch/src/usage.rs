@@ -126,6 +126,12 @@ pub fn profile_dirs() -> Vec<PathBuf> {
     profiles().into_iter().map(|p| p.dir).collect()
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreditAmounts {
+    pub consumed: f64,
+    pub allowance: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LimitWindow {
     pub id: String,
@@ -144,6 +150,11 @@ pub struct LimitWindow {
     /// for several things (Antigravity: a 5-hour and a weekly lane per model family). None = ungrouped
     #[serde(default)]
     pub group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits: Option<CreditAmounts>,
+    /// Provider-reported duration; missing means the cycle start cannot be reconstructed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -750,6 +761,17 @@ pub fn start(app: AppHandle) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn persisted_windows_without_a_duration_stay_compatible() {
+        let old: super::LimitWindow = serde_json::from_str(r#"{"id":"secondary","label":"Weekly","used":0.25,"resets_at":null}"#).unwrap();
+        assert_eq!(old.duration_seconds,None);
+        assert!(old.credits.is_none());
+        let saved=serde_json::to_value(&old).unwrap();
+        assert!(saved.get("duration_seconds").is_none());
+        let reported=super::LimitWindow { duration_seconds:Some(604800), ..old };
+        let restored: super::LimitWindow=serde_json::from_str(&serde_json::to_string(&reported).unwrap()).unwrap();
+        assert_eq!(restored.duration_seconds,Some(604800));
+    }
     use super::*;
 
     const EXP: u64 = 1_000_000_000;

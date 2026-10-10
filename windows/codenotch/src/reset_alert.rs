@@ -164,7 +164,7 @@ fn show_on_main(app: &AppHandle, event: ResetEvent, token: u64) -> Result<(), St
         .cloned()
         .unwrap_or_default();
     let now = crate::now_ms();
-    let provider_name = crate::provider_label(&event.provider);
+    let provider_name = crate::provider_display_name(app, &event.provider);
     let window_label = traymenu::label(&event.window_label, &lang);
     let payload = CardPayload {
         lang: lang.clone(),

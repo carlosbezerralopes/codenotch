@@ -32,8 +32,8 @@ test('Kiro draws only declared credits and never a weekly bonus ring', () => {
 
 test('Installation and sign-out are distinct; selection hides the Kiro cell', () => {
   const absent = () => ({ status: 'absent', windows: [] });
-  const c = vm.createContext({ claudeCells: () => [], codexSnap: absent(), glmSnap: absent(), opencodeSnap: absent(), cursorSnap: absent(), grokSnap: absent(), copilotSnap: absent(), agSnap: absent(), kiroSnap: absent(), notchSlots: [], slotFor: id => c.notchSlots.find(s => s.provider === id) });
-  vm.runInContext(fn(notch, 'providers'), c);
+  const c = vm.createContext({ claudeCells: () => [], codexSnap: absent(), glmSnap: absent(), opencodeSnap: absent(), cursorSnap: absent(), grokSnap: absent(), copilotSnap: absent(), agSnap: absent(), kiroSnap: absent(), notchSlots: [], providerOrder: [], providerNicknames: {}, slotFor: id => c.notchSlots.find(s => s.provider === id) });
+  vm.runInContext(fn(notch, 'providerDisplayName') + fn(notch, 'presentProviders') + fn(notch, 'providers'), c);
   assert.equal(c.providers().length, 0);
   c.kiroSnap = { status: 'needsAuth', windows: [], note: 'Run kiro-cli login' };
   assert.equal(c.providers()[0].id, 'kiro');

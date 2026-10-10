@@ -9,10 +9,8 @@ on:
     paths:
       - 'windows/**'
       - '.github/workflows/windows.yml'
+  # Required checks must also run on documentation-only pull requests.
   pull_request:
-    paths:
-      - 'windows/**'
-      - '.github/workflows/windows.yml'
 
 jobs:
   build:
@@ -62,6 +60,9 @@ jobs:
 
       - name: Test Kiro ring and fork updates
         run: node --test test-kiro.cjs scripts/test-fork-updates.cjs
+
+      - name: Test credits, presentation, telemetry, privacy and working pace
+        run: node --test test-kiro-credits.cjs test-provider-presentation.cjs test-telemetry-ui.cjs test-activity-privacy.cjs test-work-pace.cjs
 
       - name: Test Codex headline selection
         run: node --test test-codex-headline.cjs
