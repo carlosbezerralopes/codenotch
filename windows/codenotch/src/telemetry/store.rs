@@ -159,7 +159,12 @@ pub(super) fn atomic_file(path:&Path,bytes:&[u8],replace:bool)->Result<(),String
         {
             use std::os::windows::ffi::OsStrExt;
             #[link(name="kernel32")] extern "system" {fn MoveFileExW(from:*const u16,to:*const u16,flags:u32)->i32;}
-            let from:Vec<u16>=temp.as_os_str().encode_wide().chain(Some(0)).collect();let to:Vec<u16>=path.as_os_str().encode_wide().chain(Some(0)).collect();
+            // Rust file operations accept long paths, but this raw Win32 call needs the
+            // extended-length syntax. The new destination does not exist yet, so resolve
+            // its existing parent, then append the unchanged final file name.
+            let from_path=fs::canonicalize(&temp).map_err(|error|error.to_string())?;
+            let to_path=fs::canonicalize(parent).map_err(|error|error.to_string())?.join(path.file_name().ok_or("Destination has no file name")?);
+            let from:Vec<u16>=from_path.as_os_str().encode_wide().chain(Some(0)).collect();let to:Vec<u16>=to_path.as_os_str().encode_wide().chain(Some(0)).collect();
             if unsafe{MoveFileExW(from.as_ptr(),to.as_ptr(),0x8|if replace{0x1}else{0})}==0 {return Err(std::io::Error::last_os_error().to_string());}
             return Ok(());
         }
@@ -249,5 +254,18 @@ mod tests {
     #[test]fn older_original_file_digest_is_rebuilt_for_normalized_cache_json(){
         let root=std::env::temp_dir().join("codenotch").join(format!("telemetry-old-digest-{}",unique_id()));let path=journal_fixture(&root);let parsed:Batch=serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();let pretty=serde_json::to_vec_pretty(&parsed).unwrap();fs::write(&path,&pretty).unwrap();let cache=root.join("cache.sqlite");let mut issues=vec![];load(&root,&cache,&mut issues).unwrap();
         let connection=Connection::open(&cache).unwrap();connection.execute("UPDATE batches SET hash=?1",[hash(&pretty)]).unwrap();drop(connection);issues.clear();let dataset=load(&root,&cache,&mut issues).unwrap();assert_journal_recovered(&dataset,&issues);assert_eq!(fs::read(&path).unwrap(),pretty);issues.clear();load(&root,&cache,&mut issues).unwrap();assert!(issues.is_empty());let _=fs::remove_dir_all(root);
+    }
+    #[cfg(windows)]
+    #[test]fn long_unicode_windows_paths_keep_atomic_create_replace_and_immutability(){
+        use std::os::windows::ffi::OsStrExt;
+        let root=std::env::temp_dir().join("codenotch").join(format!("telemetry-long-path-{}",unique_id()));
+        let parent=root.join(format!("André-{}","a".repeat(120))).join(format!("telemetria-{}","b".repeat(120)));let target=parent.join("batch-á.json");
+        assert!(target.as_os_str().encode_wide().count()>260);
+        atomic_file(&target,b"original",false).unwrap();assert_eq!(fs::read(&target).unwrap(),b"original");
+        assert!(atomic_file(&target,b"immutable replacement",false).is_err());assert_eq!(fs::read(&target).unwrap(),b"original");
+        atomic_file(&target,b"updated",true).unwrap();assert_eq!(fs::read(&target).unwrap(),b"updated");
+        let canonical=fs::canonicalize(&target).unwrap();assert!(canonical.to_string_lossy().starts_with(r"\\?\"));
+        let temporary_count=fs::read_dir(&parent).unwrap().filter_map(Result::ok).filter(|entry|entry.file_name().to_string_lossy().ends_with(".tmp")).count();assert_eq!(temporary_count,0);
+        let _=fs::remove_dir_all(root);
     }
 }
