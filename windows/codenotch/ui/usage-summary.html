@@ -1,0 +1,96 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root{color-scheme:dark;--bg:#202020;--text:#eee;--muted:#aaa;--line:#444;--accent:#69b8ff}
+:root[data-theme="light"]{color-scheme:light;--bg:#fafafa;--text:#222;--muted:#666;--line:#ccc;--accent:#0067c0}
+*{box-sizing:border-box}body{margin:0;padding:18px;font:13px system-ui;background:var(--bg);color:var(--text)}
+h2{font-size:16px;margin:20px 0 10px}.summary-window{border:1px solid var(--line);border-radius:9px;padding:12px;margin:8px 0;scroll-margin:12px}.summary-window:focus{outline:2px solid var(--accent);outline-offset:2px}
+.pace-label{display:flex;justify-content:space-between;gap:18px;margin:7px 0;flex-wrap:wrap}.pace-label>span:last-child{font-variant-numeric:tabular-nums}.pace-note{font-size:12px;color:var(--muted);margin:7px 0}.pace-track{height:4px;background:var(--line);border-radius:3px;overflow:hidden}.pace-fill{height:100%;background:var(--accent)}
+button{font:inherit;background:transparent;border:1px solid var(--line);border-radius:5px;padding:5px 10px;color:var(--accent);cursor:pointer}.provider-head{display:flex;align-items:center;justify-content:space-between;gap:12px}h3{margin:0 0 10px;font-size:13px}
+.pace-body{margin:15px 0 10px}.pace-value{font-size:28px;font-weight:500;font-variant-numeric:tabular-nums}.pace-forecast{margin:12px 0;padding:10px;background:var(--line);border-radius:6px}.pace-forecast[data-warning="true"]{color:var(--accent)}.pace-timeline{margin:18px 0}.pace-line{position:relative;height:9px;border-radius:3px;background:var(--line)}.pace-line-fill{height:100%;background:var(--accent)}.pace-stem{position:absolute;top:-4px;width:2px;height:17px;background:var(--text)}.pace-stem-end{right:0}.pace-axis,.pace-timeline-labels{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;font-size:11px;margin-top:7px}.pace-timeline-labels>span{max-width:100%;overflow-wrap:anywhere}.quota-detail{margin-top:10px;border-top:1px solid var(--line);padding-top:8px}.quota-detail summary{cursor:pointer}.quota-detail summary:focus-visible{outline:2px solid var(--accent)}
+</style></head><body><div id="report" aria-live="polite"></div>
+<script src="usage-insights.js"></script>
+<script>
+(function(){
+  'use strict';
+  const I=CodenotchInsights;
+  let api=null,context={active:false,language:'en',theme:'dark',provider:null,window_index:null},timer=null,focusKey=null;
+  const report=document.getElementById('report');
+  const expanded=new Set();
+  const accountSignatures=new Map();
+  const loader=I.loader(provider=>api.get_provider_insights(provider),()=>render());
+  function render(){
+    const language=context.language,t=I.words(language);
+    const priorFocus=document.activeElement?.id;
+    let html='';
+    for(const provider of ['claude','codex','kiro']){
+      const dto=loader.get(provider);
+      if(dto){
+        const signature=JSON.stringify(dto.windows.map(w=>[I.key(w),w.quota_role||null,w.period_kind||null]));
+        if(accountSignatures.has(provider)&&accountSignatures.get(provider)!==signature)for(const key of expanded)if(key.startsWith(provider+':'))expanded.delete(key);
+        accountSignatures.set(provider,signature);
+      }
+      html+=`<section><div class="provider-head"><h2>${I.esc(provider==='claude'?'Claude':provider==='codex'?'Codex':'Kiro')}</h2><button data-history="${provider}">${I.esc(t.history)}</button></div>`;
+      if(!dto)html+=`<p class="pace-note">${I.esc(loader.failed(provider)?t.error:t.loading)}</p>`;
+      else if(!dto.windows.length)html+=`<p class="pace-note">${I.esc(t.missing_reading)}</p>`;
+      else for(const account of provider==='claude'?I.accounts(dto.windows):[{id:provider,windows:dto.windows}]){
+        const main=provider==='claude'?I.general(account.windows):null;
+        if(provider==='claude'){html+=`<div class="summary-account"><h3>${I.esc(account.windows[0]?.group||'Claude')}</h3>`;if(!main)html+=`<p class="pace-note">${I.esc(t.generalMissing)}</p>`;}
+        for(const w of account.windows){
+        if(!Number.isSafeInteger(w.window_index)||w.window_index<0||w.window_index>4095)continue;
+        const target=context.provider===provider&&context.window_index===w.window_index;
+        const detailKey=provider+':'+account.id+':'+I.key(w);
+        const compact=provider==='claude'&&w!==main;
+        if(compact){
+          html+=`<article class="summary-window" tabindex="-1" id="usage-${provider}-${w.window_index}">`;
+          if(I.role(w)==='session')html+=I.compact(w,language);
+          else{
+            const opening=expanded.has(detailKey)||(target&&focusKey!==context.provider+':'+context.window_index);
+            if(opening)expanded.add(detailKey);
+            html+=`<details class="quota-detail" data-quota-key="${I.esc(detailKey)}" ${opening?'open':''}><summary>${I.esc(w.label)} · ${I.esc(I.number(w.official_used_percent,language,1)+'% '+t.used)}${w.official_used_percent>=100?' · '+I.esc(t.exhausted):''} · ${I.esc(t.renew+' '+I.date(w.period?.reset_ms,language))}</summary>${I.extended(w,language)}</details>`+I.qualify(w,language);
+          }
+          html+='</article>';continue;
+        }
+        html+=`<article class="summary-window" tabindex="-1" id="usage-${provider}-${w.window_index}"><h3>${I.esc(w.group?w.group+' · '+w.label:w.label)}</h3>`;
+        html+=I.track(t.official,w.official_used_percent,I.number(w.official_used_percent,language,1)+'% '+t.used);
+        if(w.credits)html+=`<div class="pace-note">${I.esc(I.number(w.credits.consumed,language)+' / '+I.number(w.credits.allowance,language)+' '+t.credits)}</div>`;
+        if(w.period)html+=`<div class="pace-note">${I.esc(t.until+' · '+I.date(w.period.reset_ms,language))}</div>`;
+        html+=I.details(w,language)+'</article>';
+        }
+        if(provider==='claude')html+='</div>';
+      }
+      html+='</section>';
+    }
+    report.innerHTML=html;
+    for(const detail of report.querySelectorAll?.('[data-quota-key]')||[])detail.ontoggle=()=>{if(detail.open)expanded.add(detail.dataset.quotaKey);else expanded.delete(detail.dataset.quotaKey);};
+    for(const detail of report.querySelectorAll?.('[data-evidence-key]')||[]){const key=detail.closest('article').id+':evidence:'+detail.dataset.evidenceKey;detail.open=expanded.has(key);detail.ontoggle=()=>{if(detail.open)expanded.add(key);else expanded.delete(key);};}
+    if(context.active&&priorFocus?.startsWith('usage-'))document.getElementById(priorFocus)?.focus();
+    const key=context.provider+':'+context.window_index;
+    if(context.active&&I.supported(context.provider)&&Number.isSafeInteger(context.window_index)&&focusKey!==key){
+      const target=document.getElementById('usage-'+context.provider+'-'+context.window_index);
+      if(target){target.focus();target.scrollIntoView({block:'nearest'});focusKey=key;}
+    }
+  }
+  function refresh(){if(!context.active||!api)return Promise.resolve();return Promise.all(['claude','codex','kiro'].map(provider=>loader.refresh(provider)));}
+  function update(next){
+    const was=context.active,oldProvider=context.provider,oldIndex=context.window_index;
+    context={...context,...next};
+    context.provider=I.supported(context.provider)?context.provider:null;
+    context.window_index=Number.isSafeInteger(context.window_index)&&context.window_index>=0&&context.window_index<=4095?context.window_index:null;
+    if(oldProvider!==context.provider||oldIndex!==context.window_index){focusKey=null;expanded.clear();}
+    document.documentElement.dataset.theme=context.theme==='light'?'light':'dark';
+    document.documentElement.lang=context.language||'en';
+    if(!context.active){focusKey=null;expanded.clear();accountSignatures.clear();loader.invalidate();if(timer)clearInterval(timer);timer=null;}
+    else if(!timer)timer=setInterval(refresh,30000);
+    render();return context.active&&!was?refresh():Promise.resolve();
+  }
+  report.addEventListener('click',event=>{
+    const button=event.target.closest('[data-history]');
+    if(button&&api&&I.supported(button.dataset.history))api.open_telemetry(button.dataset.history).catch(()=>{});
+  });
+  window.CodenotchUsage={mount(nextApi,next){
+    if(!nextApi||typeof nextApi.get_provider_insights!=='function'||typeof nextApi.open_telemetry!=='function')return Promise.reject(new Error('Usage API unavailable'));
+    api=nextApi;return update(next);
+  },update,refresh};
+})();
+</script></body></html>

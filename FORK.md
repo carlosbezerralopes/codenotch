@@ -1,6 +1,8 @@
 # Codenotch — fork Windows
 
-Fork: [carlosbezerralopes/codenotch](https://github.com/carlosbezerralopes/codenotch).
+Fork: [carlosbezerralopes/codenotch](https://github.com/carlosbezerralopes/codenotch),
+vinculado ao projeto original. Esta árvore inclui o port Kiro inicial e as
+evoluções Windows, consolidadas na PR do proprietário.
 Base: [vinzdg/codenotch](https://github.com/vinzdg/codenotch), commit
 `bcb28894d1514fef5a810595d64b44a3817c2076`.
 
@@ -11,14 +13,14 @@ O suporte Kiro usa a CLI nativa e sua sessão existente para ler `/usage`.
 Veja [pré-requisitos e comportamento](windows/README.md). A IDE sozinha não
 fornece essa integração; instalar este fork não instala nem autentica o Kiro.
 
-O repositório foi desvinculado da rede de forks e tornado privado. A distribuição
-Windows usa downloads autenticados das releases ou dos artifacts do Actions.
-O updater anônimo não acessa releases privadas; atualizações automáticas precisam
-de um mecanismo autenticado e da chave de assinatura antes de serem habilitadas.
+O remote e os endereços de distribuição apontam para esse fork.
+O updater exige pacotes assinados; um destino privado também exige acesso
+autenticado. A origem/licença do repositório original devem ser preservadas.
 
 O Windows também oferece créditos absolutos Kiro no tooltip, ordem e nomes
 personalizados, detalhes de atividade recolhidos por padrão e histórico de
-consumo com destino configurável. Os eventos e pontos de leitura são guardados
+consumo integrado às configurações e orçamento diário/semanal por dias úteis.
+Os eventos e pontos de leitura são guardados
 por máquina e consolidados. Veja [telemetria](windows/docs/telemetry.md) e
 [calendário de dias úteis](windows/docs/work-calendar.md).
 
@@ -36,3 +38,6 @@ cargo test --locked
 Rust/MSVC são pré-requisitos para o build Windows. A leitura real do Kiro exige
 `kiro-cli` instalado e autenticado. Fixtures não comprovam leitura da conta real.
 Os workflows Windows verificam build/testes e produzem o instalador do fork.
+A versão 1.22.2 passa pelos checks do fork. O README aponta para o artifact
+Windows de nome fixo da última execução de push validada. Merge e release
+estável continuam dependendo do aval do proprietário.

@@ -36,6 +36,8 @@ mod telemetry;
 mod telemetry_window;
 mod telemetry_picker;
 mod work_calendar;
+mod usage_insights;
+mod quota_projection;
 mod topmost;
 mod updater;
 
@@ -46,7 +48,7 @@ use tauri::{AppHandle, Emitter, Manager};
 /// and its tail on the left. `fitZoom` in ui/notch.html divides by the same width.
 pub const NOTCH_W: f64 = 360.0;
 /// Hand-bumped build tag, written to run.log at startup so a log can always be matched to the exe that wrote it.
-pub const BUILD: &str = "r34";
+pub const BUILD: &str = "r36";
 /// The notch window's long side: the upright window's height, and both sides of the flat one.
 ///
 /// Five cells make a 447 px pill; its fillets add 38.7 px at each end and the settings orb reaches
@@ -1719,7 +1721,7 @@ async fn get_telemetry_report(app: AppHandle, query: telemetry::TelemetryQuery) 
 async fn choose_telemetry_directory(app: AppHandle) -> Result<Option<String>, String> {
     let settings = get_telemetry_settings(app.clone()).await?;
     #[cfg(windows)]
-    let owner = app.get_webview_window("telemetry").and_then(|w| w.hwnd().ok()).map(|h| h.0 as isize).unwrap_or(0);
+    let owner = app.get_webview_window("settings").or_else(|| app.get_webview_window("telemetry")).and_then(|w| w.hwnd().ok()).map(|h| h.0 as isize).unwrap_or(0);
     #[cfg(not(windows))]
     let owner = 0;
     tauri::async_runtime::spawn_blocking(move || telemetry_picker::choose(settings.export_directory.or(settings.suggested_directory), owner))
@@ -1727,7 +1729,63 @@ async fn choose_telemetry_directory(app: AppHandle) -> Result<Option<String>, St
 }
 
 #[tauri::command]
-fn open_telemetry(app: AppHandle) { telemetry_window::open(&app); }
+fn open_telemetry(app: AppHandle, provider: Option<String>) { settings_window::open_section(&app, "history", provider.as_deref(), None); }
+
+#[derive(serde::Deserialize)]
+struct ExpectedInsightSource {
+    window_index: usize,
+    window_id: String,
+    group: Option<String>,
+    account_key: Option<String>,
+    bucket_key: Option<String>,
+    reading_transport: Option<usage::QuotaReadingTransport>,
+    reset_basis: Option<usage::QuotaResetBasis>,
+    fetched_at: Option<u64>,
+    status: Option<String>,
+}
+
+fn insight_sources_match(provider: &str, snapshot: &usage::UsageSnapshot, expected: &[ExpectedInsightSource]) -> bool {
+    if expected.len() > 4096 { return false; }
+    expected.iter().all(|e| snapshot.windows.get(e.window_index).is_some_and(|w| {
+        let origin = usage_insights::window_origin(provider, snapshot, w);
+        w.id == e.window_id && w.group == e.group
+            && w.quota_account_key == e.account_key && w.quota_bucket_key == e.bucket_key
+            && w.reading_transport == e.reading_transport && w.reset_basis == e.reset_basis
+            && origin.map(|o| o.0) == e.fetched_at && origin.map(|o| o.1) == e.status.as_deref()
+    }))
+}
+
+pub(crate) fn provider_insights_from_snapshot(app: &AppHandle, provider: &str, snapshot: &usage::UsageSnapshot,
+    calendar: Option<&work_calendar::CalendarSettings>, now: u64) -> usage_insights::ProviderInsights {
+    let mut base = usage_insights::compute_provider_insights(provider, snapshot, calendar, now);
+    if !matches!(provider, "claude" | "codex" | "kiro") { return base; }
+    let requests = quota_projection::history_requests(provider, snapshot, &base, calendar, now);
+    let mut history: std::collections::HashMap<usize, telemetry::quota_index::QuotaHistoryResult> = requests.iter().map(|r| (r.window_index,
+        telemetry::quota_index::QuotaHistoryResult { state: telemetry::quota_index::QuotaHistoryState::Unavailable,
+            samples: Vec::new(), complete_horizon: false, segment_started_at_ms: None, revised: false })).collect();
+    if let Ok(service) = telemetry_service(app) {
+        // A hover must not wait for collection or OneDrive hydration.
+        if let Ok(mut state) = service.try_lock() {
+            state.ingest_quota_snapshot(provider, snapshot, &base);
+            history = state.quota_rate_history(&requests);
+        }
+    }
+    quota_projection::attach_projections(provider, snapshot, &mut base, calendar, &history, now);
+    base
+}
+
+#[tauri::command]
+async fn get_provider_insights(app: AppHandle, provider: String, expected_sources: Option<Vec<ExpectedInsightSource>>) -> Result<usage_insights::ProviderInsights, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if !matches!(provider.as_str(), "claude" | "codex" | "kiro") { return Err("Unknown usage provider".into()); }
+        let snapshot = snapshot_of(&app, &provider);
+        if expected_sources.as_ref().is_some_and(|e| !insight_sources_match(&provider, &snapshot, e)) {
+            return Err("Quota source changed; wait for the latest reading".into());
+        }
+        let calendar = work_calendar::get_calendar_settings().ok();
+        Ok(provider_insights_from_snapshot(&app, &provider, &snapshot, calendar.as_ref(), now_ms()))
+    }).await.map_err(|e| e.to_string())?
+}
 
 fn start_telemetry(app: AppHandle) {
     let Ok(service) = telemetry_service(&app) else { return; };
@@ -1737,9 +1795,28 @@ fn start_telemetry(app: AppHandle) {
     std::thread::spawn(move || {
         activity::lower_thread_priority();
         loop {
+            let job = service.lock().ok().and_then(|mut s| s.take_quota_index_refresh());
+            if let Some(job) = job {
+                let (job, issues) = telemetry::quota_index::refresh_quota_index(job);
+                if let Ok(mut s) = service.lock() { s.finish_quota_index_refresh(job, issues); }
+            }
             let result = service.lock().map_err(|_| "Telemetry lock unavailable".to_string()).and_then(|mut s| s.scan());
             match result {
-                Ok(()) => { let _ = app.emit("telemetry_updated", ()); }
+                Ok(()) => {
+                    let calendar = work_calendar::get_calendar_settings().ok();
+                    let now = now_ms();
+                    for provider in ["claude", "codex", "kiro"] {
+                        let snapshot = snapshot_of(&app, provider);
+                        if snapshot.status != "ok" || snapshot.fetched_at == 0 || snapshot.fetched_at > now
+                            || now - snapshot.fetched_at > 900_000 { continue; }
+                        // Archive the reading at its observation time, not each subsequent clock tick.
+                        let insights = usage_insights::compute_provider_insights(provider, &snapshot, calendar.as_ref(), snapshot.fetched_at);
+                        let saved = service.lock().map_err(|_| "Telemetry lock unavailable".to_string())
+                            .and_then(|mut s| s.record_quota_reading(provider, &snapshot, &insights));
+                        if let Err(error) = saved { let _ = app.emit("telemetry_error", error); }
+                    }
+                    let _ = app.emit("telemetry_updated", ());
+                }
                 Err(error) => { let _ = app.emit("telemetry_error", &error); }
             }
             for _ in 0..30 {
@@ -2075,6 +2152,7 @@ fn main() {
             get_telemetry_settings,
             set_telemetry_settings,
             get_telemetry_report,
+            get_provider_insights,
             choose_telemetry_directory,
             telemetry_window::telemetry_ready,
             work_calendar::get_calendar_settings,
@@ -2166,6 +2244,36 @@ mod tests {
         NOTCH_W, TRAY_PROVIDER_IDS,
     };
     use crate::usage::LimitWindow;
+
+    #[test]
+    fn insight_response_rejects_a_switched_account_even_with_equal_values() {
+        let mut snapshot: crate::usage::UsageSnapshot = serde_json::from_value(serde_json::json!({
+            "fetched_at": 1000, "status": "ok", "note": "", "windows": [{"id": "weekly", "label": "Weekly",
+            "used": 0.25, "resets_at": 9000, "quota_account_key": "account-a", "quota_bucket_key": "bucket-a"}]
+        })).unwrap();
+        let expected: Vec<super::ExpectedInsightSource> = serde_json::from_value(serde_json::json!([{
+            "window_index": 0, "window_id": "weekly", "account_key": "account-a", "bucket_key": "bucket-a",
+            "fetched_at": 1000, "status": "ok"
+        }])).unwrap();
+        assert!(super::insight_sources_match("codex", &snapshot, &expected));
+        snapshot.windows[0].quota_account_key = Some("account-b".into());
+        assert!(!super::insight_sources_match("codex", &snapshot, &expected));
+        snapshot.windows[0].quota_account_key = Some("account-a".into());
+        snapshot.windows[0].quota_bucket_key = Some("bucket-b".into());
+        assert!(!super::insight_sources_match("codex", &snapshot, &expected));
+    }
+
+    #[test]
+    fn grouped_claude_cannot_borrow_aggregate_freshness() {
+        let snapshot: crate::usage::UsageSnapshot = serde_json::from_value(serde_json::json!({
+            "fetched_at": 1000, "status": "ok", "note": "", "windows": [{"id": "weekly@a", "label": "Weekly",
+            "group": "a", "used": 0.25, "resets_at": 9000}]
+        })).unwrap();
+        let expected: Vec<super::ExpectedInsightSource> = serde_json::from_value(serde_json::json!([{
+            "window_index": 0, "window_id": "weekly@a", "group": "a", "fetched_at": 1000, "status": "ok"
+        }])).unwrap();
+        assert!(!super::insight_sources_match("claude", &snapshot, &expected));
+    }
 
     /// A provider added without a page of its own used to fall through to Claude's
     #[test]

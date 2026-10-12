@@ -10,6 +10,156 @@
 
 use crate::usage::{LimitWindow, UsageSnapshot};
 
+pub fn matching_insight<'a>(dto: &'a crate::usage_insights::ProviderInsights, source: &LimitWindow, index: usize) -> Option<&'a crate::usage_insights::WindowInsights> {
+    dto.windows.iter().find(|w| w.window_index == index && w.window_id == source.id && w.group == source.group)
+}
+
+pub fn insight_target(id: &str) -> Option<(&str, usize)> {
+    let mut parts = id.split(':');
+    if parts.next()? != "insight" { return None; }
+    let provider = parts.next()?;
+    if !matches!(provider, "claude" | "codex" | "kiro") { return None; }
+    let raw = parts.next()?;
+    if raw.is_empty() || raw.len() > 4 || !raw.bytes().all(|b| b.is_ascii_digit()) || parts.next().is_some() { return None; }
+    let index = raw.parse::<usize>().ok()?;
+    (index <= 4095).then_some((provider, index))
+}
+
+/// Windows counts UTF-16 code units, not Rust bytes or Unicode scalar values.
+pub fn bounded_tooltip(text: &str) -> String {
+    if text.encode_utf16().count() <= 128 { return text.into(); }
+    let mut result = String::new();
+    let mut units = 0;
+    for ch in text.chars() {
+        if units + ch.len_utf16() > 127 { break; }
+        result.push(ch);
+        units += ch.len_utf16();
+    }
+    result.push('…');
+    result
+}
+
+fn legacy_insight_lines(w: &crate::usage_insights::WindowInsights, lang: &str) -> Vec<String> {
+    use crate::usage_insights::{BudgetUnit, InsightReason};
+    let pt = lang == "pt-BR";
+    let num = |v: f64| { let s = format!("{v:.2}"); if pt { s.replace('.', ",") } else { s } };
+    let mut lines = Vec::new();
+    if let Some(c) = &w.credits {
+        lines.push(format!("{}: {} {}", if pt { "Saldo" } else { "Remaining" }, num(c.remaining), if pt { "créditos" } else { "credits" }));
+    }
+    if !w.fresh {
+        let stale = w.reasons.contains(&InsightReason::Stale);
+        lines.push(if stale {
+            if pt { "Leitura desatualizada; referências indisponíveis." } else { "Outdated reading; references unavailable." }
+        } else if pt { "Referências derivadas indisponíveis." } else { "Derived references unavailable." }.into());
+    } else {
+        if let Some(work) = &w.work {
+            let until = w.period.as_ref().map(|p| system_datetime(p.reset_ms)).unwrap_or_default();
+            lines.push(format!("{} {} {} {}", num(work.remaining_days), if pt { "dias úteis até" } else { "business days until" }, if pt { "renovação" } else { "reset" }, until));
+            if let Some(gap) = work.used_minus_work_pp {
+                lines.push(format!("{} pp {}", num(gap.abs()), if pt { if gap >= 0.0 { "acima do tempo útil no ciclo" } else { "abaixo do tempo útil no ciclo" } } else if gap >= 0.0 { "above business time in the cycle" } else { "below business time in the cycle" }));
+            }
+        }
+        if let Some(b) = &w.budget {
+            let unit = match b.unit { BudgetUnit::Credits => if pt { " créditos" } else { " credits" }, BudgetUnit::Percent => "%" };
+            lines.push(format!("{}: {}{} · {}: {}{}", if pt { "Disponível/dia útil restante" } else { "Available/remaining business day" }, num(b.per_remaining_workday), unit, if pt { "Nesta semana até renovação" } else { "This week until reset" }, num(b.week_remaining_budget), unit));
+            if let Some(reference) = b.reference_per_cycle_workday {
+                lines.push(format!("{}: {}{}", if pt { "Referência do ciclo/dia útil" } else { "Cycle reference/business day" }, num(reference), unit));
+            }
+            if let Some(reference) = b.week_reference_budget {
+                lines.push(format!("{}: {}{}", if pt { "Referência do ciclo nesta semana" } else { "Cycle reference this week" }, num(reference), unit));
+            }
+            lines.push(if pt { "Referência derivada; o provedor define a cota oficial." } else { "Derived reference; the provider defines the official quota." }.into());
+        }
+    }
+    for reason in &w.reasons {
+        let text = match reason {
+            InsightReason::UnknownCreditScope => Some(if pt { "Saldo pode incluir adicionais; referência mensal indisponível." } else { "Balance may include add-ons; monthly reference unavailable." }),
+            InsightReason::NonrenewingWallet => Some(if pt { "Bônus/excedente separados da cota mensal." } else { "Bonus/overage are separate from the monthly quota." }),
+            InsightReason::CalendarPartial => Some(if pt { "Calendário parcial; feriados locais não confirmados." } else { "Partial calendar; local holidays unconfirmed." }),
+            InsightReason::CalendarMissing => Some(if pt { "Calendário indisponível." } else { "Calendar unavailable." }),
+            InsightReason::CalendarOutsideCoverage => Some(if pt { "Calendário não cobre o intervalo." } else { "Calendar does not cover the interval." }),
+            InsightReason::UnknownStart => Some(if pt { "Início do ciclo desconhecido." } else { "Cycle start unknown." }),
+            InsightReason::NoRemainingWorkdays => Some(if pt { "Sem tempo útil restante." } else { "No business time remains." }),
+            InsightReason::NoWorkdays => Some(if pt { "Sem tempo útil neste ciclo." } else { "No business time in this cycle." }),
+            InsightReason::MissingReset => Some(if pt { "Data de renovação indisponível." } else { "Reset date unavailable." }),
+            InsightReason::ResetExpired => Some(if pt { "Aguardando nova data de renovação." } else { "Waiting for a new reset date." }),
+            InsightReason::InvalidPeriod => Some(if pt { "Intervalo do ciclo indisponível." } else { "Cycle interval unavailable." }),
+            InsightReason::MissingReading | InsightReason::InvalidReading => Some(if pt { "Leitura da cota indisponível." } else { "Quota reading unavailable." }),
+            InsightReason::MissingWindowFreshness => Some(if pt { "A atualização desta conta não foi confirmada." } else { "The freshness of this account reading is unknown." }),
+            _ => None,
+        };
+        if let Some(text) = text { lines.push(text.into()); }
+    }
+    lines
+}
+
+pub fn insight_lines(w: &crate::usage_insights::WindowInsights, lang: &str) -> Vec<String> {
+    use crate::usage_insights::{DisplayBudgetMode, ProjectionBasis, ProjectionReason, ProjectionState, QuotaRole};
+    // Old cached DTOs retain their qualified references until the next reading.
+    if w.quota_role.is_none() { return legacy_insight_lines(w, lang); }
+    if w.quota_role != Some(QuotaRole::General) { return Vec::new(); }
+    let pt = lang == "pt-BR";
+    let mut lines = Vec::new();
+    if !w.fresh {
+        let text = w.last_reading_reference.as_ref().map(|r| format!("{} {}", if pt { "Última leitura:" } else { "Last reading:" }, system_datetime(r.as_of_ms)))
+            .unwrap_or_else(|| if pt { "Leitura indisponível" } else { "Reading unavailable" }.into());
+        lines.push(text);
+        return lines;
+    }
+    if let Some(b) = &w.display_budget {
+        if let Some(amount) = b.amount.filter(|_| b.is_current) {
+            let caption = match b.mode {
+                DisplayBudgetMode::PerWorkday => Some(if pt { "Pode usar/dia útil" } else { "Available/workday" }),
+                DisplayBudgetMode::UntilReset | DisplayBudgetMode::ExtraDaysUntilReset => Some(if pt { "Saldo até renovar" } else { "Balance until reset" }),
+                _ => None,
+            };
+            if let Some(caption) = caption { lines.push(format!("{caption}: {}", budget_amount(amount, b.amount_percent, b.unit, pt))); }
+        }
+    }
+    if let Some(p) = &w.projection {
+        if let Some(rate) = p.rate_per_workday {
+            let caption = if p.basis == Some(ProjectionBasis::ObservedRecent) {
+                if pt { "Ritmo observado/dia útil" } else { "Observed pace/workday" }
+            } else { if pt { "Média do ciclo/dia útil" } else { "Cycle mean/workday" } };
+            lines.push(format!("{caption}: {}", budget_amount(rate, p.rate_percent, p.unit, pt)));
+        }
+        let early = p.early_workdays.map(|d| if d > 0.0 && d < 0.1 { if pt { "<0,1" } else { "<0.1" }.into() } else { format!("{d:.1}").replace('.', if pt { "," } else { "." }) }).unwrap_or_else(|| "—".into());
+        let unavailable = if p.reasons.iter().any(|r| matches!(r, ProjectionReason::CalendarMissing | ProjectionReason::CalendarOutsideCoverage)) {
+            if pt { "Previsão indisponível; revisar calendário" } else { "Forecast unavailable; check calendar" }
+        } else if p.reasons.iter().any(|r| matches!(r, ProjectionReason::MissingReset | ProjectionReason::UnknownStart | ProjectionReason::InvalidPeriod | ProjectionReason::ResetExpired)) {
+            if pt { "Previsão indisponível; período não confirmado" } else { "Forecast unavailable; period not confirmed" }
+        } else if p.reasons.contains(&ProjectionReason::HistoryUnavailable) {
+            if pt { "Histórico indisponível para previsão" } else { "History unavailable for forecasting" }
+        } else { if pt { "Previsão aguardando histórico suficiente" } else { "Forecast awaiting sufficient history" } };
+        lines.push(match p.state {
+            ProjectionState::BeforeReset => format!("{} {early} {}", if pt { "Neste ritmo, esgota" } else { "At this pace, runs out" }, if pt { "dias úteis antes de renovar" } else { "workdays before reset" }),
+            ProjectionState::ProjectedDue => if pt { "Esgotamento projetado já alcançado; conferir saldo oficial" } else { "Projected exhaustion reached; check official balance" }.into(),
+            ProjectionState::CoversReset => if pt { "Saldo cobre até a renovação neste ritmo" } else { "Balance covers reset at this pace" }.into(),
+            ProjectionState::Exhausted => if pt { "Cota oficial esgotada" } else { "Official quota exhausted" }.into(),
+            ProjectionState::InsufficientWorkTime => if pt { "Ainda sem tempo útil suficiente para medir o ritmo" } else { "Not enough business time to measure pace yet" }.into(),
+            ProjectionState::NoRemainingWorkTime => if pt { "Restam apenas dias extras até renovar" } else { "Only extra days remain before reset" }.into(),
+            _ => unavailable.into(),
+        });
+    }
+    lines
+}
+
+fn budget_amount(amount: f64, percent: Option<f64>, unit: crate::usage_insights::BudgetUnit, pt: bool) -> String {
+    let num = |n: f64| format!("{n:.1}").replace('.', if pt { "," } else { "." });
+    match unit {
+        crate::usage_insights::BudgetUnit::Percent => format!("{}%", num(amount)),
+        crate::usage_insights::BudgetUnit::Credits => format!("{} cr{}", num(amount), percent.map(|p| format!(" ({}%)", num(p))).unwrap_or_default()),
+    }
+}
+
+pub fn insight_tooltip(w: &crate::usage_insights::WindowInsights, lang: &str) -> Option<String> {
+    use crate::usage_insights::DisplayBudgetMode;
+    let b = w.display_budget.as_ref()?;
+    if !w.fresh || !b.is_current || b.mode != DisplayBudgetMode::PerWorkday { return None; }
+    Some(format!("{}/{}", budget_amount(b.amount?, b.amount_percent, b.unit, lang == "pt-BR"), if lang == "pt-BR" { "útil" } else { "workday" }))
+}
+
 /// A reading as the card prints it: whole percents, except where rounding would claim nothing is
 /// used or nothing is left.
 pub fn pct(fraction: f64) -> String {
@@ -365,6 +515,98 @@ mod tests {
     }
 
     const MIN: u64 = 60 * 1000;
+
+    #[test]
+    fn insight_links_are_bounded_and_have_an_exact_provider() {
+        assert_eq!(insight_target("insight:claude:0"), Some(("claude", 0)));
+        assert_eq!(insight_target("insight:kiro:4095"), Some(("kiro", 4095)));
+        for raw in ["insight:codex:4096", "insight:codex:-1", "insight:codex:1:2", "insight:evil:0", "insight:claude:1e3", "insight:kiro:", "refresh:claude"] {
+            assert_eq!(insight_target(raw), None, "{raw}");
+        }
+    }
+
+    #[test]
+    fn tray_insight_attachment_rejects_reordered_or_replaced_account_windows() {
+        let source = LimitWindow { id: "weekly@a".into(), group: Some("Account A".into()), ..Default::default() };
+        let snapshot = UsageSnapshot { windows: vec![source.clone()], ..Default::default() };
+        let dto = crate::usage_insights::compute_provider_insights("claude", &snapshot, None, 1000);
+        assert!(matching_insight(&dto, &source, 0).is_some());
+        assert!(matching_insight(&dto, &source, 1).is_none());
+        let changed_group = LimitWindow { group: Some("Account B".into()), ..source.clone() };
+        assert!(matching_insight(&dto, &changed_group, 0).is_none());
+        let changed_id = LimitWindow { id: "weekly@b".into(), ..source.clone() };
+        assert!(matching_insight(&dto, &changed_id, 0).is_none());
+    }
+
+    #[test]
+    fn tray_hover_respects_windows_utf16_limit_without_splitting_surrogates() {
+        assert_eq!(bounded_tooltip("Codenotch — Claude 25%"), "Codenotch — Claude 25%");
+        let text = format!("{}😀suffix", "a".repeat(126));
+        let bounded = bounded_tooltip(&text);
+        assert_eq!(bounded, format!("{}…", "a".repeat(126)));
+        assert!(bounded.encode_utf16().count() <= 128);
+        assert_eq!(bounded_tooltip(&"😀".repeat(70)).chars().last(), Some('…'));
+    }
+
+    #[test]
+    fn tray_insights_format_dto_budget_and_explain_unknown_credit_scope() {
+        let mut w: crate::usage_insights::WindowInsights = serde_json::from_value(serde_json::json!({
+            "window_index": 3, "window_id": "credits", "label": "Credits", "group": null,
+            "fresh": true, "official_used_percent": 25, "official_remaining_percent": 75,
+            "credits": { "consumed": 82.79, "allowance": 5000, "remaining": 4917.21, "scope": "plan" },
+            "period": null, "work": null,
+            "budget": { "unit": "credits", "remaining": 4917.21, "per_remaining_workday": 245.86,
+                "reference_per_cycle_workday": 250, "week_start_ms": 1, "week_end_ms": 2,
+                "week_remaining_workdays": 2, "week_remaining_budget": 491.72, "week_reference_budget": 500 },
+            "reasons": []
+        })).unwrap();
+        let pt = insight_lines(&w, "pt-BR").join("\n");
+        assert!(pt.contains("4917,21 créditos"));
+        assert!(pt.contains("245,86 créditos"));
+        assert!(pt.contains("491,72 créditos"));
+        assert!(pt.contains("Referência derivada"));
+        assert!(!pt.contains("245,86%"));
+        w.fresh = false;
+        assert!(!insight_lines(&w, "en").join("\n").contains("245.86"));
+        w.fresh = true; w.budget = None;
+        w.reasons = vec![crate::usage_insights::InsightReason::UnknownCreditScope];
+        let en = insight_lines(&w, "en").join("\n");
+        assert!(en.contains("monthly reference unavailable"));
+        assert!(!en.contains("Available/remaining"));
+        w.fresh = false;
+        w.reasons = vec![crate::usage_insights::InsightReason::MissingWindowFreshness];
+        let unknown = insight_lines(&w, "pt-BR").join("\n");
+        assert!(unknown.contains("A atualização desta conta não foi confirmada"));
+        assert!(!unknown.contains("Leitura desatualizada"));
+    }
+
+    #[test]
+    fn balance_and_deadline_stays_compact_and_uses_dto_units() {
+        let source = LimitWindow { id: "credits".into(), label: "Credits".into(), used: 0.25, ..Default::default() };
+        let snapshot = UsageSnapshot { windows: vec![source], ..Default::default() };
+        let mut w = crate::usage_insights::compute_provider_insights("kiro", &snapshot, None, 1000).windows.remove(0);
+        w.fresh = true;
+        w.quota_role = Some(crate::usage_insights::QuotaRole::General);
+        w.display_budget = Some(serde_json::from_value(serde_json::json!({
+            "mode": "per_workday", "unit": "credits", "amount": 200, "amount_percent": 5,
+            "workdays_remaining": 6, "as_of_ms": 1000, "is_current": true
+        })).unwrap());
+        assert_eq!(insight_lines(&w, "pt-BR"), vec!["Pode usar/dia útil: 200,0 cr (5,0%)"]);
+        assert_eq!(insight_tooltip(&w, "pt-BR").unwrap(), "200,0 cr (5,0%)/útil");
+        w.projection = Some(serde_json::from_value(serde_json::json!({
+            "state": "unavailable", "unit": "credits", "sample_count": 0,
+            "extra_or_mixed_consumption": false, "reasons": ["calendar_outside_coverage"]
+        })).unwrap());
+        assert!(insight_lines(&w, "pt-BR").join("\n").contains("revisar calendário"));
+        assert!(!insight_lines(&w, "pt-BR").join("\n").contains("aguardando histórico"));
+        w.projection.as_mut().unwrap().state = crate::usage_insights::ProjectionState::BeforeReset;
+        w.projection.as_mut().unwrap().early_workdays = Some(0.01);
+        assert!(insight_lines(&w, "en").join("\n").contains("At this pace, runs out <0.1"));
+        w.quota_role = Some(crate::usage_insights::QuotaRole::Scoped);
+        assert!(insight_lines(&w, "pt-BR").is_empty());
+        w.fresh = false;
+        assert!(insight_tooltip(&w, "pt-BR").is_none());
+    }
 
     #[test]
     fn a_reading_reads_as_the_card_prints_it() {

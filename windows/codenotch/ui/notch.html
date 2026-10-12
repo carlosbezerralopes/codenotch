@@ -139,6 +139,8 @@
   .pace-track{height:4px;background:var(--bar);border-radius:2px;margin:5px 0;overflow:hidden}
   .pace-fill{height:100%;background:var(--ink-dim);opacity:.7}
   .pace-note{font-size:10px;color:var(--ink-dim);margin-top:5px;line-height:1.4}
+  .pace-body{margin:12px 0 8px}.pace-value{font-size:24px;font-weight:500;font-variant-numeric:tabular-nums}.pace-forecast{font-size:11px;line-height:1.4;margin:10px 0;padding:8px;border-radius:5px;background:var(--bar)}.pace-forecast[data-warning="true"]{color:var(--warn,#e6a86d)}
+  .pace-timeline{margin-top:14px}.pace-line{position:relative;height:8px;background:var(--bar);border-radius:3px}.pace-line-fill{height:100%;background:var(--ink-dim);opacity:.65}.pace-stem{position:absolute;top:-4px;height:16px;width:2px;background:var(--ink)}.pace-stem-end{right:0}.pace-axis,.pace-timeline-labels{display:flex;justify-content:space-between;gap:8px;font-size:10px;line-height:1.4;margin-top:6px;flex-wrap:wrap}.pace-timeline-labels>span{overflow-wrap:anywhere;max-width:100%}.quota-detail{border-top:1px solid var(--bar);margin-top:8px;padding-top:6px;font-size:11px}.quota-detail summary{cursor:pointer;line-height:1.5}.quota-detail summary:focus-visible{outline:2px solid var(--ink)}
   .g-head{font-size:12px;font-weight:700;color:var(--ink-2);margin-top:12px}
   .g-box{border:1px solid var(--card-line);border-radius:10px;padding:0 10px 8px;margin-top:6px}
   .c-note{font-size:12px;color:var(--ink-3);line-height:1.5;margin-top:6px}
@@ -337,6 +339,7 @@
   </svg>
   <div id="notice"></div>
 </div>
+<script src="usage-insights.js"></script>
 <script>
 const invoke = window.__TAURI__.core.invoke;
 const listen = window.__TAURI__.event.listen;
@@ -1150,16 +1153,17 @@ function claudeCells(){
   const accounts=[];
   for(const w of ws){
     const g=w.group||'';
-    if(!accounts.some(a=>a.g===g)) accounts.push({g:g,slug:(String(w.id).split('@')[1]||'')});
+    const slug=String(w.id).split('@').slice(1).join('@');
+    if(!accounts.some(a=>a.g===g&&a.slug===slug)) accounts.push({g:g,slug});
   }
   // One account (or a reading with no headings yet) is the single cell it has always been
   if(accounts.length<2) return [{id:'claude',base:'claude',name:'Claude',glyph:'C',snap:usage}];
   return accounts.map(a=>({
-    id:a.slug?'claude@'+a.slug:'claude',
+    id:(a.slug?'claude@'+a.slug:'claude')+(accounts.filter(other=>other.slug===a.slug).length>1?'#'+encodeURIComponent(a.g):''),
     base:'claude',
     name:a.g||'Claude',
     glyph:'C',
-    snap:Object.assign({},usage,{windows:ws.filter(w=>(w.group||'')===a.g)
+    snap:Object.assign({},usage,{windows:ws.map((w,index)=>Object.assign({},w,{insight_window_index:index,insight_window_id:w.id})).filter(w=>(w.group||'')===a.g&&String(w.id).split('@').slice(1).join('@')===a.slug)
       .map(w=>Object.assign({},w,{id:String(w.id).split('@')[0]}))})
   }));
 }
@@ -1426,66 +1430,60 @@ function activityPrivacyClick(event,p){
 // END TESTABLE ACTIVITY PRIVACY
 
 // BEGIN TESTABLE WORK PACE
-let workCalendar=null;
-const PACE_DAY_MS=86400000;
-const PACE_TEXT={
-  en:{official:'Official quota',elapsed:'Elapsed time · derived',business:'Business days · derived',partial:'Business days · partial calendar',unavailable:'Business days unavailable',calendarMissing:'Calendar unavailable. Check the location in Settings.',noWorkdays:'No business time in this cycle.',outsideCoverage:'Calendar does not cover this cycle.',localMissing:'Local holidays are not confirmed. Add your nonworking dates in Settings.',extra:'Weekend and holiday spending still counts towards the official quota.',days:'days',above:'pp above business time',below:'pp below business time',equal:'Usage matches business time'},
-  'pt-BR':{official:'Cota oficial',elapsed:'Tempo corrido · derivado',business:'Dias úteis · derivado',partial:'Dias úteis · calendário parcial',unavailable:'Dias úteis indisponíveis',calendarMissing:'Calendário indisponível. Confira a localização nas Configurações.',noWorkdays:'Não há tempo útil neste ciclo.',outsideCoverage:'O calendário não cobre este ciclo.',localMissing:'Feriados locais não confirmados. Cadastre suas datas sem trabalho nas Configurações.',extra:'O consumo em fins de semana e feriados continua contando na cota oficial.',days:'dias',above:'pp acima do tempo útil',below:'pp abaixo do tempo útil',equal:'Consumo igual ao tempo útil'},
-};
-function paceWords(){return PACE_TEXT[uiLang]||PACE_TEXT.en;}
-function computePace(window,snapshot,now=Date.now(),calendar=workCalendar){
-  const duration=window.duration_seconds, reset=window.resets_at, fetched=snapshot.fetched_at;
-  if(snapshot.status!=='ok'||!Number.isFinite(fetched)||fetched<=0||fetched>now||now-fetched>900000
-    ||!Number.isSafeInteger(duration)||duration<6*86400||duration>8*86400
-    ||!Number.isSafeInteger(reset)||reset<=now||!Number.isFinite(window.used)||window.used<0||window.used>1||window.count!=null) return null;
-  const start=reset-duration*1000;
-  if(start<=0||now<start) return null;
-  const result={elapsed:(now-start)/(reset-start),business:null,elapsed_days:null,total_days:null,gap_pp:null,partial:true,reason:'calendarMissing'};
-  if(!calendar||!Number.isInteger(calendar.utc_offset_minutes)||calendar.utc_offset_minutes< -720||calendar.utc_offset_minutes>840
-    ||!Array.isArray(calendar.holidays)||!Array.isArray(calendar.overrides)||!Array.isArray(calendar.covered_years)) return result;
-  const offset=calendar.utc_offset_minutes*60000;
-  const holidays=new Set(calendar.holidays.map(day=>day.date));
-  const overrides=new Map(calendar.overrides.map(day=>[day.date,day.nonworking]));
-  let total=0,elapsed=0;
-  for(let day=Math.floor((start+offset)/PACE_DAY_MS);day*PACE_DAY_MS-offset<reset;day++){
-    const local=new Date(day*PACE_DAY_MS),date=local.toISOString().slice(0,10);
-    if(!calendar.covered_years.includes(local.getUTCFullYear())){result.reason='outsideCoverage';return result;}
-    const weekday=local.getUTCDay();
-    const nonworking=overrides.has(date)?overrides.get(date):holidays.has(date);
-    if(weekday===0||weekday===6||nonworking) continue;
-    const from=Math.max(start,day*PACE_DAY_MS-offset),to=Math.min(reset,(day+1)*PACE_DAY_MS-offset);
-    total+=to-from;
-    elapsed+=Math.max(0,Math.min(now,to)-from);
+const usageGeneration={claude:0,codex:0,kiro:0};
+let quotaDetailProvider=null;
+let quotaDetailIdentity=null;
+const quotaDetailState=new Map();
+function resetQuotaDetails(){quotaDetailState.clear();quotaDetailProvider=null;quotaDetailIdentity=null;}
+function rawInsightKey(p,w,index){return JSON.stringify([index,w.insight_window_id||w.id,w.group||null,w.used,w.resets_at,w.credits||null,w.credit_scope||null,w.quota_account_key||null,w.quota_bucket_key||null,w.reading_transport||null,w.reset_basis||null,w.reading_fetched_at??p.snap.fetched_at,w.reading_status??p.snap.status]);}
+function acceptUsageEvent(provider,apply,snapshot){usageGeneration[provider]++;apply(snapshot);}
+async function loadInitialUsage(provider,command,apply){
+  const generation=usageGeneration[provider];
+  const snapshot=await invoke(command);
+  if(generation!==usageGeneration[provider])return false;
+  apply(snapshot);refreshInsights(provider);renderRing();return true;
+}
+const insightLoader=CodenotchInsights.loader(async provider=>{
+  const sources=new Map(),expectedSources=[];
+  const visible=typeof providers==='function'?providers().filter(p=>p.base===provider):[];
+  const headerOriginAllowed=provider!=='claude'||visible.every(p=>p.snap.windows.every(w=>w.group==null&&!String(w.insight_window_id||w.id).includes('@')));
+  for(const p of visible)for(const [i,w] of p.snap.windows.entries()){
+    const index=w.insight_window_index??i;
+    sources.set(index,rawInsightKey(p,w,index));
+    const explicit=w.reading_fetched_at!=null&&w.reading_status!=null;
+    const header=w.reading_fetched_at==null&&w.reading_status==null&&headerOriginAllowed;
+    expectedSources.push({window_index:index,window_id:w.insight_window_id||w.id,group:w.group??null,account_key:w.quota_account_key??null,bucket_key:w.quota_bucket_key??null,reading_transport:w.reading_transport??null,reset_basis:w.reset_basis??null,fetched_at:explicit?w.reading_fetched_at:header?p.snap.fetched_at??null:null,status:explicit?w.reading_status:header?p.snap.status??null:null});
   }
-  result.partial=!(calendar.source_coverage&&calendar.source_coverage.national&&calendar.source_coverage.state&&calendar.source_coverage.municipal);
-  if(total<=0){result.reason='noWorkdays';return result;}
-  result.business=elapsed/total;
-  result.elapsed_days=elapsed/PACE_DAY_MS;
-  result.total_days=total/PACE_DAY_MS;
-  result.gap_pp=(window.used-result.business)*100;
-  result.reason='';
-  return result;
+  const dto=await invoke('get_provider_insights',{provider,expectedSources});
+  return {...dto,source_keys:sources};
+},()=>{
+  if(typeof card!=='undefined'&&card.classList.contains('show'))renderCard();
+});
+function refreshInsights(provider){return insightLoader.refresh(provider);}
+function insightFor(p,w,index){
+  if(!CodenotchInsights.supported(p.base))return null;
+  const originalIndex=Number.isSafeInteger(w.insight_window_index)?w.insight_window_index:index;
+  const originalId=w.insight_window_id||w.id;
+  const insight=CodenotchInsights.match(insightLoader.get(p.base),{id:originalId,group:w.group},originalIndex);
+  if(!insight)return null;
+  const sources=insightLoader.get(p.base).source_keys;
+  if(sources?.size&&sources.get(originalIndex)!==rawInsightKey(p,w,originalIndex))return null;
+  const sourceAt=w.reading_fetched_at??p.snap.fetched_at;
+  const dtoAt=insight.display_budget?.as_of_ms??insight.projection?.sampled_to_ms??insight.last_reading_reference?.as_of_ms;
+  if(Number.isSafeInteger(sourceAt)&&sourceAt>0&&Number.isSafeInteger(dtoAt)&&dtoAt!==sourceAt)return null;
+  if(insight.fresh&&w.reading_status!=null&&w.reading_status!=='ok')return null;
+  if(insight.fresh&&w.reading_fetched_at!=null&&(!Number.isSafeInteger(w.reading_fetched_at)||w.reading_fetched_at<=0||w.reading_fetched_at>Date.now()||staleOf({status:w.reading_status,fetched_at:w.reading_fetched_at})))return null;
+  const equal=(a,b)=>typeof a==='number'&&typeof b==='number'&&Number.isFinite(a)&&Number.isFinite(b)&&Math.abs(a-b)<=1e-7;
+  // This verifies that two readings agree; quota/calendar arithmetic stays in Rust.
+  if(!equal(w.used*100,insight.official_used_percent))return null;
+  if(insight.period&&insight.period.reset_ms!==w.resets_at)return null;
+  const rawCredits=w.credits,credits=insight.credits;
+  if(credits&&(!rawCredits||!equal(credits.consumed,rawCredits.consumed)||!equal(credits.allowance,rawCredits.allowance)||credits.scope!==(w.credit_scope||'unknown')))return null;
+  if(!credits&&rawCredits&&Number.isFinite(rawCredits.consumed)&&Number.isFinite(rawCredits.allowance)&&rawCredits.allowance>0)return null;
+  return insight&&(staleOf(p.snap)||p.snap.status!=='ok')?{...insight,fresh:false}:insight;
 }
-function paceNumber(value,maximum=2){
-  return new Intl.NumberFormat(ui().locale,{maximumFractionDigits:maximum}).format(value);
-}
-function paceTrack(label,fraction,value){
-  const percent=Math.max(0,Math.min(100,fraction*100));
-  return `<div class="pace-label"><span>${esc(label)}</span><span>${esc(value)}</span></div><div class="pace-track" role="progressbar" aria-label="${esc(label)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent.toFixed(2)}"><div class="pace-fill" style="width:${percent.toFixed(2)}%"></div></div>`;
-}
-function workPaceHtml(pace){
-  const words=paceWords();
-  let html=paceTrack(words.elapsed,pace.elapsed,paceNumber(pace.elapsed*100,1)+'%');
-  if(pace.business===null){
-    return html+`<div class="pace-label">${esc(words.unavailable)}</div><div class="pace-note">${esc(words[pace.reason]||words.calendarMissing)}</div>`;
-  }
-  const days=paceNumber(pace.elapsed_days)+' / '+paceNumber(pace.total_days)+' '+words.days;
-  html+=paceTrack(pace.partial?words.partial:words.business,pace.business,days+' · '+paceNumber(pace.business*100,1)+'%');
-  const gap=Math.abs(pace.gap_pp)<0.05?words.equal:paceNumber(Math.abs(pace.gap_pp),1)+' '+(pace.gap_pp>0?words.above:words.below);
-  html+=`<div class="pace-note">${esc(gap)}</div>`;
-  if(pace.partial) html+=`<div class="pace-note">${esc(words.localMissing)}</div>`;
-  return html+`<div class="pace-note">${esc(words.extra)}</div>`;
-}
+function workPaceHtml(insight){return CodenotchInsights.details(insight,uiLang);}
+function paceWords(){return CodenotchInsights.words(uiLang);}
 // END TESTABLE WORK PACE
 
 let hoverId='claude';
@@ -1518,6 +1516,9 @@ function renderCard(){
   const p=list.find(x=>x.id===hoverId)||list[0];
   if(!p){ hoverId=null; c.innerHTML=''; hideCard(); return; }
   selectActivityProvider(p.id);
+  if(quotaDetailProvider!==p.id){resetQuotaDetails();quotaDetailProvider=p.id;}
+  const quotaIdentity=JSON.stringify(p.snap.windows.map(w=>[w.insight_window_id||w.id,w.group||null,w.quota_account_key||null,w.quota_bucket_key||null]));
+  if(quotaDetailIdentity!==quotaIdentity){quotaDetailState.clear();quotaDetailIdentity=quotaIdentity;}
   hoverId=p.id;
   const snap=p.snap;
   const headIcon=glyphHtml(p,true);
@@ -1533,7 +1534,9 @@ function renderCard(){
   }else{
     // Windows that share a group (Antigravity's model families) sit in one box under its name, as on the Mac
     let group=null;
-    for(const w of snap.windows){
+    const general=p.base==='claude'?CodenotchInsights.general(snap.windows.map((w,i)=>insightFor(p,w,i)).filter(Boolean)):null;
+    if(p.base==='claude'&&!general)html+=`<div class="pace-note">${esc(paceWords().generalMissing)}</div>`;
+    for(const [windowIndex,w] of snap.windows.entries()){
       if((w.group||null)!==group){
         if(group) html+=`</div>`;
         group=w.group||null;
@@ -1544,13 +1547,23 @@ function renderCard(){
           <div class="w-used">${w.count>0?`~${w.count} ${textCopy(w.count===1?'request today':'requests today')}`:textCopy('no requests today')}</div></div>`;
         continue;
       }
-      const pace=p.base==='codex'?computePace(w,snap):null;
+      const pace=insightFor(p,w,windowIndex);
+      const secondary=p.base==='claude'&&(!general||pace?.window_index!==general.window_index);
+      if(secondary){
+        const detailKey=JSON.stringify([p.id,w.insight_window_id||w.id,w.group||null,w.insight_window_index??windowIndex]);
+        const blocked=w.used>=1?` · ${esc(paceWords().exhausted)}`:'';
+        if(pace&&CodenotchInsights.role(pace)!=='session'){
+          html+=`<details class="quota-detail" data-quota-key="${esc(detailKey)}" ${quotaDetailState.get(detailKey)?'open':''}><summary>${esc(textCopy(w.label))} · ${esc(usedCopy(w))}${blocked} · ${esc(resetCopy(w.resets_at))}</summary>${CodenotchInsights.extended(pace,uiLang)}</details>`;
+          html+=CodenotchInsights.qualify(pace,uiLang);
+        }else html+=`<div class="win"><div class="w-row"><span>${esc(textCopy(w.label))} · ${esc(usedCopy(w))}${blocked}</span><span class="w-reset">${resetCopy(w.resets_at)}</span></div>${pace?CodenotchInsights.qualify(pace,uiLang):''}</div>`;
+        continue;
+      }
       html+=`<div class="win">
         <div class="w-row"><span class="w-label">${esc(textCopy(w.label))}</span><span class="w-reset">${resetCopy(w.resets_at)}</span></div>
         ${pace?`<div class="pace-label">${esc(paceWords().official)}</div>`:''}
         <div class="w-track"><div class="w-fill" style="width:${(Math.min(w.used,1)*100).toFixed(0)}%;background:${tone(w.used)}"></div></div>
         <div class="w-used">${esc(usedCopy(w))}</div>
-        ${pace?workPaceHtml(pace):''}
+        ${pace?workPaceHtml(pace):CodenotchInsights.supported(p.base)?`<div class="pace-note">${esc(paceWords().missing)}</div>`:''}
         ${creditAmountsHtml(p,w)}
       </div>`;
     }
@@ -1560,7 +1573,9 @@ function renderCard(){
   if(offersClaudeSignIn(p)) html+=claudeAuthHtml(claudeAuth,claudeActionMessage);
   html+=activityPrivacyHtml(p);
   c.innerHTML=html;
-  c.onclick=e=>activityPrivacyClick(e,p);
+  c.onclick=e=>{const quota=e.target.closest('details,summary');if(quota&&['DETAILS','SUMMARY'].includes(quota.tagName)){e.stopPropagation();return;}activityPrivacyClick(e,p);};
+  for(const detail of c.querySelectorAll?.('[data-quota-key]')||[])detail.ontoggle=()=>quotaDetailState.set(detail.dataset.quotaKey,detail.open);
+  for(const detail of c.querySelectorAll?.('[data-evidence-key]')||[]){const key='evidence:'+detail.dataset.evidenceKey;detail.open=quotaDetailState.get(key)||false;detail.ontoggle=()=>quotaDetailState.set(key,detail.open);}
   const signIn=c.querySelector('#claude-sign-in');
   if(signIn) signIn.onclick=e=>{e.stopPropagation();signInClaude();};
   placeCard();
@@ -1609,7 +1624,7 @@ function esc(s){const d=document.createElement('div');d.textContent=s||'';return
 /* Hover: stays expanded while either the pill or the card is under the cursor; collapses after a 250 ms grace period (upstream motion rule) */
 const card=document.getElementById('card'), pill=document.getElementById('pill'), tail=document.getElementById('tail');
 let hideTimer=null;
-function showCard(){clearTimeout(hideTimer);resetActivityDetails();card.classList.add('show');renderCard();armWatchdog();refreshClock();} // show first, then render: placeCard needs offsetHeight
+function showCard(){clearTimeout(hideTimer);resetActivityDetails();resetQuotaDetails();card.classList.add('show');renderCard();armWatchdog();refreshClock();} // show first, then render: placeCard needs offsetHeight
 // Nothing is broadcast when the Windows clock format changes, so ask again each time the card opens
 function refreshClock(){
   invoke('get_state').then(s=>{
@@ -1618,7 +1633,7 @@ function refreshClock(){
     if(card.classList.contains('show')) renderCard();
   }).catch(()=>{});
 }
-function hideCard(){resetActivityDetails();card.innerHTML='';card.onclick=null;card.classList.remove('show');reportHot();}
+function hideCard(){resetActivityDetails();resetQuotaDetails();card.innerHTML='';card.onclick=null;card.classList.remove('show');reportHot();}
 function scheduleHide(){clearTimeout(hideTimer);hideTimer=setTimeout(hideCard,250);}
 // ===== Diagnostics + geometry =====
 function jslog(m){invoke('log_js',{msg:String(m)}).catch(()=>{});}
@@ -2274,12 +2289,12 @@ listen('pill_backdrop',e=>{
 }).catch(()=>{});
 invoke('get_ui_flags').then(applyUiFlags).catch(()=>{});
 
-listen('usage',e=>{usage=e.payload||usage;claudeActionMessage='';settle('claude');renderRing();if(card.classList.contains('show'))renderCard();})
+listen('usage',e=>{acceptUsageEvent('claude',u=>{usage=u||usage;},e.payload);refreshInsights('claude');claudeActionMessage='';settle('claude');renderRing();if(card.classList.contains('show'))renderCard();})
   .catch(e=>notice('listen(usage) failed: '+e));
 listen('state',e=>{stateSnap=e.payload||stateSnap;setUiLanguage(stateSnap.lang_resolved);renderRing();if(card.classList.contains('show'))renderCard();})
   .catch(e=>notice('listen(state) failed: '+e));
 listen('notice',e=>notice(e.payload)).catch(()=>{});
-listen('codex',e=>{codexSnap=e.payload||codexSnap;settle('codex');renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
+listen('codex',e=>{acceptUsageEvent('codex',u=>{codexSnap=u||codexSnap;},e.payload);refreshInsights('codex');settle('codex');renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
 listen('cursor',e=>{cursorSnap=e.payload||cursorSnap;settle('cursor');renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
 invoke('get_cursor').then(u=>{cursorSnap=u||cursorSnap;renderRing();}).catch(()=>{});
 listen('grok',e=>{grokSnap=e.payload||grokSnap;settle('grok');renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
@@ -2291,8 +2306,8 @@ listen('antigravity',e=>{agSnap=e.payload||agSnap;settle('gemini');renderRing();
 invoke('get_antigravity').then(u=>{agSnap=u||agSnap;renderRing();}).catch(()=>{});
 listen('glm',e=>{glmSnap=e.payload||glmSnap;renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
 invoke('get_glm').then(u=>{glmSnap=u||glmSnap;renderRing();}).catch(()=>{});
-listen('kiro',e=>{kiroSnap=e.payload||kiroSnap;settle('kiro');renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
-invoke('get_kiro').then(u=>{kiroSnap=u||kiroSnap;renderRing();}).catch(()=>{});
+listen('kiro',e=>{acceptUsageEvent('kiro',u=>{kiroSnap=u||kiroSnap;},e.payload);refreshInsights('kiro');settle('kiro');renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
+loadInitialUsage('kiro','get_kiro',u=>{kiroSnap=u||kiroSnap;}).catch(()=>{});
 listen('opencode',e=>{opencodeSnap=e.payload||opencodeSnap;settle('opencode');renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
 invoke('get_opencode').then(u=>{opencodeSnap=u||opencodeSnap;renderRing();}).catch(()=>{});
 invoke('get_notch_slots').then(v=>{if(Array.isArray(v)){notchSlots=v;renderRing();}}).catch(()=>{});
@@ -2311,8 +2326,7 @@ invoke('get_provider_nicknames').then(v=>{
 listen('provider_nicknames',e=>{
   if(e.payload&&typeof e.payload==='object'){providerNicknames=e.payload;renderRing();if(card.classList.contains('show'))renderCard();}
 }).catch(()=>{});
-invoke('get_calendar_settings').then(settings=>{workCalendar=settings||null;if(card.classList.contains('show'))renderCard();}).catch(()=>{workCalendar=null;});
-listen('work_calendar_changed',e=>{workCalendar=e.payload||null;if(card.classList.contains('show'))renderCard();}).catch(()=>{});
+listen('work_calendar_changed',()=>{for(const provider of ['claude','codex','kiro'])refreshInsights(provider);}).catch(()=>{});
 invoke('get_antigravity_prefs').then(p=>{if(p){agPrefs=p;renderRing();}}).catch(()=>{});
 invoke('get_weekly_ring').then(v=>{if(typeof v==='string'){weeklyRing=v;renderRing();}}).catch(()=>{});
 listen('weekly_ring',e=>{if(typeof e.payload==='string'){weeklyRing=e.payload;renderRing();}}).catch(()=>{});
@@ -2335,10 +2349,10 @@ listen('notch_edge',e=>applyEdge(e.payload)).catch(()=>{});
 // applyEdge measures for the edge it is given; on the right-hand one it returns early, so the first
 // measurement is made here either way — and still made if the ask fails, from the default edge.
 invoke('get_notch_edge').then(e=>{applyEdge(e);reportDpr();}).catch(()=>reportDpr());
-invoke('get_codex').then(u=>{codexSnap=u||codexSnap;renderRing();}).catch(()=>{});
-invoke('get_usage').then(u=>{usage=u||usage;renderRing();}).catch(e=>notice('get_usage failed: '+e));
+loadInitialUsage('codex','get_codex',u=>{codexSnap=u||codexSnap;}).catch(()=>{});
+loadInitialUsage('claude','get_usage',u=>{usage=u||usage;}).catch(e=>notice('get_usage failed: '+e));
 invoke('get_state').then(s=>{stateSnap=s||stateSnap;setUiLanguage(stateSnap.lang_resolved);renderRing();}).catch(()=>{});
-setInterval(renderRing,30_000); // stale state and reset copy move with time
+setInterval(()=>{renderRing();for(const provider of ['claude','codex','kiro'])refreshInsights(provider);},30_000); // stale state and reset copy move with time
 setInterval(async()=>{
   if(!claudeAuth.busy&&!(hoverId==='claude'&&card.classList.contains('show'))) return;
   try{

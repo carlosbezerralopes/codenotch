@@ -1,8 +1,10 @@
 //! Kiro CLI /usage is authoritative; GetUsageLimits only enriches its credit ceilings.
 //! Borrowed SQLite authentication is read-only and never refreshed by Codenotch.
-use crate::usage::{CreditAmounts, LimitWindow, UsageSnapshot};
+use crate::usage::{quota_key, CreditAmounts, CreditScope, LimitWindow, QuotaReadingTransport, QuotaResetBasis, UsageSnapshot};
 use crate::AppState;
-use chrono::{Datelike, Local, NaiveDate, TimeZone};
+use chrono::{Datelike, Local, NaiveDate, TimeZone, Timelike, Utc};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -10,6 +12,10 @@ use tauri::{AppHandle, Emitter, Manager};
 
 const ARGS: [&str; 3] = ["chat", "--no-interactive", "/usage"];
 const OUTPUT_LIMIT: usize = 64 * 1024;
+const POLL_ACTIVE_MS: u64 = 30_000;
+const POLL_IDLE_MS: u64 = 30 * 60_000;
+const ACTIVITY_RECENT_MS: u64 = 120_000;
+const MAX_FAILURES: u8 = 3;
 static REFRESH: AtomicBool = AtomicBool::new(false);
 
 pub fn request_refresh() { REFRESH.store(true, Ordering::Relaxed); }
@@ -17,6 +23,7 @@ fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 fn store_path() -> PathBuf { crate::config::config_path().with_file_name("kiro-usage.json") }
+fn poll_path() -> PathBuf { crate::config::config_path().with_file_name("kiro-poll.json") }
 fn absent() -> UsageSnapshot { UsageSnapshot { status: "absent".into(), ..Default::default() } }
 
 fn runnable(path: &Path) -> bool {
@@ -65,8 +72,144 @@ pub fn load_persisted() -> UsageSnapshot {
         .unwrap_or_default()
 }
 
-#[derive(Debug, PartialEq)]
-enum ReadError { NeedsAuth, TimedOut, BadOutput, Process }
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+enum ReadError { NeedsAuth, TimedOut, BadOutput, Process, RateLimited }
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+struct PollState {
+    version: u8,
+    consecutive_failures: u8,
+    standby: bool,
+    last_failure: Option<ReadError>,
+    // Internal change detector only; credentials themselves never enter app state.
+    auth_fingerprint: Option<String>,
+    #[serde(default)] post_probe_observation_pending: bool,
+    #[serde(skip)] storage_blocked: bool,
+    last_attempt_ms: u64,
+}
+impl Default for PollState {
+    fn default() -> Self { Self { version: 1, consecutive_failures: 0, standby: false,
+        last_failure: None, auth_fingerprint: None, post_probe_observation_pending: false,
+        storage_blocked: false, last_attempt_ms: 0 } }
+}
+
+impl PollState {
+    fn observe(&mut self, auth: &AuthObservation, manual: bool) {
+        let mut changed = false;
+        if let Some(fingerprint) = &auth.fingerprint {
+            let different = self.auth_fingerprint.as_ref() != Some(fingerprint);
+            changed = !self.post_probe_observation_pending && self.auth_fingerprint.is_some() && different;
+            // An unchanged token after a failed probe does not prove its late refresh is over.
+            if !self.post_probe_observation_pending || different || self.consecutive_failures == 0 {
+                self.post_probe_observation_pending = false;
+            }
+            self.auth_fingerprint = Some(fingerprint.clone());
+        }
+        if manual || (changed && !self.storage_blocked) {
+            self.consecutive_failures = 0; self.standby = false;
+            self.last_failure = None; self.last_attempt_ms = 0;
+        }
+    }
+    fn due(&self, now: u64, active: bool) -> bool {
+        !self.standby && (self.last_attempt_ms == 0 || now < self.last_attempt_ms
+            || now.saturating_sub(self.last_attempt_ms) >= if active || self.consecutive_failures > 0 { POLL_ACTIVE_MS } else { POLL_IDLE_MS })
+    }
+    fn block_expired(&mut self, auth: &AuthObservation, manual: bool, now: u64) -> bool {
+        if auth.expired(now) && !manual {
+            self.standby = true; self.last_failure = Some(ReadError::NeedsAuth); true
+        } else { false }
+    }
+    fn record(&mut self, now: u64, error: Option<ReadError>) {
+        self.last_attempt_ms = now;
+        self.last_failure = error;
+        self.consecutive_failures = if error.is_some() { self.consecutive_failures.saturating_add(1).min(MAX_FAILURES) } else { 0 };
+        self.standby = self.consecutive_failures >= MAX_FAILURES;
+    }
+    fn reserve_probe(&mut self, path: &Path, now: u64) -> std::io::Result<()> {
+        // A crash or failed final write consumes this attempt after restart.
+        let mut reserved = self.clone();
+        reserved.record(now, Some(ReadError::Process));
+        reserved.post_probe_observation_pending = true;
+        if let Err(error) = save_poll_state(path, &reserved) {
+            self.standby = true; self.storage_blocked = true; return Err(error);
+        }
+        self.post_probe_observation_pending = true;
+        self.storage_blocked = false;
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct AuthObservation { fingerprint: Option<String>, expires_at_ms: Option<u64> }
+impl AuthObservation {
+    fn expired(&self, now: u64) -> bool { self.expires_at_ms.is_some_and(|expiry| expiry <= now) }
+}
+
+fn first_use_state(path: &Path) -> bool {
+    if !matches!(std::fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound) { return false; }
+    for parent in path.ancestors().skip(1) {
+        match std::fs::symlink_metadata(parent) {
+            Ok(metadata) => return metadata.is_dir(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+fn load_poll_state(path: &Path) -> PollState {
+    use std::io::Read;
+    let blocked = || PollState { standby: true, storage_blocked: true, ..Default::default() };
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return if first_use_state(path) { PollState::default() } else { blocked() };
+        }
+        Err(_) => return blocked(),
+    };
+    let mut raw = Vec::new();
+    if file.take((OUTPUT_LIMIT + 1) as u64).read_to_end(&mut raw).is_err() || raw.len() > OUTPUT_LIMIT { return blocked(); }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&raw) else { return blocked(); };
+    if !["version", "consecutive_failures", "standby", "last_failure", "auth_fingerprint", "last_attempt_ms"]
+        .iter().all(|key| value.get(key).is_some()) { return blocked(); }
+    let Ok(mut state) = serde_json::from_value::<PollState>(value) else { return blocked(); };
+    if state.consecutive_failures > MAX_FAILURES { return blocked(); }
+    state.standby |= state.consecutive_failures >= MAX_FAILURES;
+    if state.version != 1 { return blocked(); }
+    state.last_attempt_ms = 0;
+    state
+}
+
+fn save_poll_state(path: &Path, state: &PollState) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+    let bytes = serde_json::to_vec(state).map_err(std::io::Error::other)?;
+    let temporary = path.with_extension("json.tmp");
+    let mut file = std::fs::File::create(&temporary)?;
+    file.write_all(&bytes)?; file.sync_all()?; drop(file);
+    std::fs::rename(temporary, path)?;
+    std::fs::OpenOptions::new().write(true).open(path)?.sync_all()?;
+    #[cfg(unix)] std::fs::File::open(path.parent().unwrap_or(Path::new(".")))?.sync_all()?;
+    Ok(())
+}
+
+fn auth_fault(text: &str) -> bool {
+    let lower = strip_ansi(text).to_ascii_lowercase();
+    ["not logged in", "login required", "failed to initialize auth portal", "kiro-cli login", "oauth error"]
+        .iter().any(|s| lower.contains(s))
+}
+
+fn process_output(exit: u32, stdout: &str, stderr: &str) -> Result<String, ReadError> {
+    // Exit status alone cannot distinguish expired auth from transport or startup failure.
+    if auth_fault(stdout) || auth_fault(stderr) { return Err(ReadError::NeedsAuth); }
+    if [stdout, stderr].iter().any(|s| {
+        let lower = s.to_ascii_lowercase();
+        ["too many requests", "rate limit exceeded", "rate limit reached", "rate limited", "http 429", "http429"]
+            .iter().any(|needle| lower.contains(needle))
+    }) { return Err(ReadError::RateLimited); }
+    if exit != 0 { return Err(ReadError::Process); }
+    usage_text(stdout, stderr).ok_or(ReadError::BadOutput)
+}
 
 fn usage_text(stdout: &str, stderr: &str) -> Option<String> {
     let text = if stdout.contains("Estimated Usage") { stdout }
@@ -115,6 +258,12 @@ fn display_plan(raw: &str) -> String {
 
 fn reset_stamp(raw: &str, now: chrono::DateTime<Local>) -> Option<u64> {
     let stamp = raw.split_whitespace().next()?;
+    // An explicit source offset is authoritative. Date-only monthly resets use UTC,
+    // as documented at https://kiro.dev/docs/billing/related-questions/.
+    if let Ok(date) = chrono::DateTime::parse_from_rfc3339(stamp) {
+        return u64::try_from(date.timestamp_millis()).ok();
+    }
+    let now = now.with_timezone(&Utc);
     let date = if stamp.contains('-') {
         NaiveDate::parse_from_str(stamp, "%Y-%m-%d").ok()?
     } else {
@@ -123,8 +272,17 @@ fn reset_stamp(raw: &str, now: chrono::DateTime<Local>) -> Option<u64> {
         let date = make(now.year())?;
         if date >= now.date_naive() { date } else { make(now.year() + 1)? }
     };
-    Local.from_local_datetime(&date.and_hms_opt(0, 0, 0)?).earliest()
+    Utc.from_local_datetime(&date.and_hms_opt(0, 0, 0)?).single()
         .map(|d| d.timestamp_millis().max(0) as u64)
+}
+
+/// A calendar month, not thirty days. Inconsistent reported reset dates stay unknown.
+pub(crate) fn monthly_duration_seconds(reset_ms: u64) -> Option<u64> {
+    let reset = chrono::DateTime::<Utc>::from_timestamp_millis(i64::try_from(reset_ms).ok()?)?;
+    if reset.day() != 1 || reset.hour() != 0 || reset.minute() != 0
+        || reset.second() != 0 || reset.timestamp_subsec_millis() != 0 { return None; }
+    let start = reset.checked_sub_months(chrono::Months::new(1))?;
+    u64::try_from((reset - start).num_seconds()).ok()
 }
 
 #[derive(Debug)]
@@ -132,9 +290,7 @@ struct Reading { plan: Option<String>, windows: Vec<LimitWindow> }
 
 fn parse_cli(text: &str, now: chrono::DateTime<Local>) -> Result<Reading, ReadError> {
     let clean = strip_ansi(text);
-    let lower = clean.to_ascii_lowercase();
-    if ["not logged in", "login required", "failed to initialize auth portal", "kiro-cli login", "oauth error"]
-        .iter().any(|s| lower.contains(s)) { return Err(ReadError::NeedsAuth); }
+    if auth_fault(&clean) { return Err(ReadError::NeedsAuth); }
     let plan = clean.lines().find_map(|line| {
         if let Some((_, tail)) = line.split_once("Plan:") {
             return tail.split('|').next().map(str::trim).filter(|s| !s.is_empty()).map(display_plan);
@@ -160,7 +316,11 @@ fn parse_cli(text: &str, now: chrono::DateTime<Local>) -> Result<Reading, ReadEr
     if let Some(used) = percent.or_else(|| credits.filter(|(_, total)| *total > 0.0).map(|(used, total)| used / total)) {
         let amounts = credits.filter(|(_, total)| *total > 0.0)
             .map(|(consumed, allowance)| CreditAmounts { consumed, allowance });
-        windows.push(LimitWindow { id: "credits".into(), label: "Credits".into(), used, resets_at, credits: amounts, ..Default::default() });
+        // Current CLI displays can combine monthly plan and add-on credits. Only the
+        // enrichment's unambiguous plan pair can authorize a monthly credit budget.
+        windows.push(LimitWindow { id: "credits".into(), label: "Credits".into(), used, resets_at,
+            reading_transport: Some(QuotaReadingTransport::KiroCli), reset_basis: Some(QuotaResetBasis::Unknown),
+            credits: amounts, credit_scope: Some(CreditScope::Unknown), ..Default::default() });
     }
     let bonus = clean.split_once("Bonus credits:").and_then(|(_, s)| pair(s, "/"));
     if let Some((used, total)) = bonus.filter(|(_, total)| *total > 0.0) {
@@ -169,6 +329,7 @@ fn parse_cli(text: &str, now: chrono::DateTime<Local>) -> Result<Reading, ReadEr
             .and_then(|n| now.checked_add_days(chrono::Days::new(n as u64)))
             .map(|d| d.timestamp_millis().max(0) as u64);
         windows.push(LimitWindow { id: "bonus".into(), label: "Credits".into(), group: Some("Bonus".into()), used: used / total, resets_at: expiry,
+            reading_transport: Some(QuotaReadingTransport::KiroCli), reset_basis: Some(QuotaResetBasis::Relative),
             credits: Some(CreditAmounts { consumed: used, allowance: total }), ..Default::default() });
     }
     if plan.is_none() && windows.is_empty() { return Err(ReadError::BadOutput); }
@@ -287,8 +448,7 @@ fn run_process(program: &Path, args: &[&str], cwd: &Path, timeout: Duration) -> 
     let (err, err_big) = err.join().map_err(|_| ReadError::Process)?;
     if !done { return Err(ReadError::TimedOut); }
     if out_big || err_big { return Err(ReadError::BadOutput); }
-    if exit != 0 { return Err(ReadError::NeedsAuth); }
-    usage_text(&String::from_utf8_lossy(&out), &String::from_utf8_lossy(&err)).ok_or(ReadError::BadOutput)
+    process_output(exit, &String::from_utf8_lossy(&out), &String::from_utf8_lossy(&err))
 }
 
 #[cfg(not(windows))]
@@ -305,24 +465,126 @@ fn database_paths() -> Vec<PathBuf> {
         .map(|p| PathBuf::from(p).join("kiro-cli/data.sqlite3")).filter(|p| p.is_absolute()).collect()
 }
 
-fn credentials(path: &Path) -> Option<(String, String)> {
+fn readonly_database(path: &Path) -> Option<rusqlite::Connection> {
     use rusqlite::OpenFlags;
     if !path.is_absolute() || !path.is_file() { return None; }
-    // A filesystem path, not a URI: ?/# cannot change SQLite's opening mode.
     let conn = rusqlite::Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX).ok()?;
     conn.busy_timeout(Duration::from_millis(50)).ok()?;
     conn.execute_batch("PRAGMA query_only=ON;").ok()?;
-    let value = |sql: &str, key: &str| -> Option<serde_json::Value> {
-        let raw: String = conn.query_row(sql, [key], |r| r.get(0)).ok()?;
-        if raw.len() > OUTPUT_LIMIT { return None; }
-        serde_json::from_str(&raw).ok()
-    };
-    let token = value("SELECT value FROM auth_kv WHERE key = ?", "kirocli:odic:token")?;
+    Some(conn)
+}
+
+fn database_json(conn: &rusqlite::Connection, sql: &str, key: &str) -> Option<serde_json::Value> {
+    let raw: String = conn.query_row(sql, [key], |r| r.get(0)).ok()?;
+    if raw.len() > OUTPUT_LIMIT { return None; }
+    serde_json::from_str(&raw).ok()
+}
+
+fn auth_from_value(value: &serde_json::Value) -> AuthObservation {
+    let Some(token) = ["access_token", "accessToken"].iter().find_map(|key|
+        value.get(key).and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty())) else { return AuthObservation::default(); };
+    let expiry = ["expires_at", "expiresAt", "expires_at_ms", "expiresAtMs", "expiration"]
+        .iter().find_map(|key| value.get(key).and_then(|v| {
+            if let Some(raw) = v.as_str() {
+                if let Ok(date) = chrono::DateTime::parse_from_rfc3339(raw) { return u64::try_from(date.timestamp_millis()).ok(); }
+            }
+            let n = v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))?;
+            if key.ends_with("ms") || key.ends_with("Ms") || n >= 100_000_000_000 { Some(n) } else { n.checked_mul(1000) }
+        }));
+    let mut hash = Sha256::new(); hash.update(token.as_bytes()); hash.update([0]);
+    if let Some(expiry) = expiry { hash.update(expiry.to_le_bytes()); }
+    AuthObservation { fingerprint: Some(format!("{:x}", hash.finalize())), expires_at_ms: expiry }
+}
+
+fn observe_auth() -> AuthObservation {
+    database_paths().iter().find_map(|path| {
+        let conn = readonly_database(path)?;
+        let value = database_json(&conn, "SELECT value FROM auth_kv WHERE key = ?", "kirocli:odic:token")?;
+        let auth = auth_from_value(&value);
+        auth.fingerprint.is_some().then_some(auth)
+    }).unwrap_or_default()
+}
+
+fn credentials(path: &Path) -> Option<(String, String)> {
+    // A filesystem path, not a URI: ?/# cannot change SQLite's opening mode.
+    let conn = readonly_database(path)?;
+    let token = database_json(&conn, "SELECT value FROM auth_kv WHERE key = ?", "kirocli:odic:token")?;
     let token = ["access_token", "accessToken"].iter().find_map(|k| token.get(k).and_then(|s| s.as_str()).map(str::trim).filter(|s| !s.is_empty()))?.to_string();
-    let profile = value("SELECT value FROM state WHERE key = ?", "api.codewhisperer.profile")?;
+    let profile = database_json(&conn, "SELECT value FROM state WHERE key = ?", "api.codewhisperer.profile")?;
     let arn = profile.get("arn")?.as_str()?.trim().to_string();
     endpoint(&arn)?;
     Some((token, arn))
+}
+
+fn plain_metadata(path: &Path) -> Option<std::fs::Metadata> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink() { return None; }
+    #[cfg(windows)] {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 { return None; }
+    }
+    Some(metadata)
+}
+
+#[derive(Default, Deserialize)]
+struct ActivityMetadata {
+    #[serde(rename = "rootPaths", default)] roots: Vec<String>,
+    #[serde(rename = "workspacePaths", default)] workspaces: Vec<String>,
+    #[serde(rename = "_meta", default)] meta: ActivityImport,
+}
+#[derive(Default, Deserialize)]
+struct ActivityImport {
+    #[serde(rename = "sincronizarConversas", default, deserialize_with = "import_marker")]
+    imported: bool,
+}
+fn import_marker<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    let _ = serde::de::IgnoredAny::deserialize(deserializer)?; Ok(true)
+}
+
+fn poller_folder(raw: &str, poll_directory: &Path) -> bool {
+    let normalized = |s: &str| s.replace('\\', "/").trim_end_matches('/').to_ascii_lowercase();
+    let raw = normalized(raw); let poll = normalized(&poll_directory.to_string_lossy());
+    raw == poll || raw.strip_prefix(&poll).is_some_and(|tail| tail.starts_with('/'))
+}
+
+fn recent_activity_at(root: &Path, poll_directory: &Path, now: u64) -> bool {
+    use std::io::Read;
+    if !plain_metadata(root).is_some_and(|m| m.is_dir()) { return false; }
+    let Ok(buckets) = std::fs::read_dir(root) else { return false; };
+    let mut entries_left = 4096usize;
+    let mut bytes_left = 256 * 1024usize;
+    for bucket in buckets.take(128).flatten() {
+        if bucket.file_name() == "cli" || !plain_metadata(&bucket.path()).is_some_and(|m| m.is_dir()) { continue; }
+        let Ok(sessions) = std::fs::read_dir(bucket.path()) else { continue; };
+        for session in sessions.flatten() {
+            if entries_left == 0 { return false; } entries_left -= 1;
+            if !session.file_name().to_string_lossy().starts_with("sess_")
+                || !plain_metadata(&session.path()).is_some_and(|m| m.is_dir()) { continue; }
+            let Some(messages) = plain_metadata(&session.path().join("messages.jsonl")).filter(|m| m.is_file() && m.len() > 0) else { continue; };
+            let Some(modified) = messages.modified().ok().and_then(|m| m.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_millis() as u64) else { continue; };
+            if !recent_activity(modified, now) { continue; }
+            let metadata_path = session.path().join("session.json");
+            let Some(metadata) = plain_metadata(&metadata_path).filter(|m| m.is_file() && m.len() <= OUTPUT_LIMIT as u64) else { continue; };
+            let length = metadata.len() as usize;
+            if length > bytes_left { continue; } bytes_left -= length;
+            let Ok(file) = std::fs::File::open(metadata_path) else { continue; };
+            let mut raw = Vec::new();
+            if file.take((length + 1) as u64).read_to_end(&mut raw).is_err() || raw.len() > length { continue; }
+            let Ok(metadata) = serde_json::from_slice::<ActivityMetadata>(&raw) else { continue; };
+            let roots = if metadata.roots.is_empty() { &metadata.workspaces } else { &metadata.roots };
+            if !metadata.meta.imported && roots.iter().any(|root| Path::new(root).is_absolute())
+                && !roots.iter().any(|root| poller_folder(root, poll_directory)) { return true; }
+        }
+    }
+    false
+}
+fn recent_activity(modified: u64, now: u64) -> bool {
+    modified <= now && now - modified <= ACTIVITY_RECENT_MS
+}
+fn kiro_active(poll_directory: &Path, now: u64) -> bool {
+    let root = std::env::var_os("KIRO_HOME").map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|p| p.join(".kiro")));
+    root.filter(|p| p.is_absolute()).is_some_and(|p| recent_activity_at(&p.join("sessions"), poll_directory, now))
 }
 
 fn endpoint(arn: &str) -> Option<&'static str> {
@@ -366,17 +628,34 @@ fn apply_limits(reading: &mut Reading, limits: CreditLimits) {
         let old = reading.windows.iter().position(|w| w.id == "credits");
         let reset = limits.reset.or_else(|| old.and_then(|i| reading.windows[i].resets_at));
         let w = LimitWindow { id: "credits".into(), label: "Credits".into(), used: limits.plan_used / limits.plan_limit, resets_at: reset,
-            credits: Some(CreditAmounts { consumed: limits.plan_used, allowance: limits.plan_limit }), ..Default::default() };
+            reading_transport: Some(QuotaReadingTransport::KiroUsageApi),
+            reset_basis: Some(if limits.reset.and_then(monthly_duration_seconds).is_some() { QuotaResetBasis::OfficialCalendarMonth }
+                else { QuotaResetBasis::Unknown }),
+            credits: Some(CreditAmounts { consumed: limits.plan_used, allowance: limits.plan_limit }),
+            credit_scope: Some(CreditScope::Plan),
+            duration_seconds: reset.and_then(monthly_duration_seconds), ..Default::default() };
         if let Some(i) = old { reading.windows[i] = w; } else { reading.windows.insert(0, w); }
+    } else if limits.bonuses {
+        if let Some(w) = reading.windows.iter_mut().find(|w| w.id == "credits") {
+            w.credit_scope = Some(CreditScope::Combined);
+        }
     }
     if let Some(cap) = limits.overage_cap.filter(|c| *c > 0.0) {
         reading.windows.push(LimitWindow { id: "overage".into(), label: "Overage".into(), used: limits.overage_used / cap, resets_at: limits.reset,
+            reading_transport: Some(QuotaReadingTransport::KiroUsageApi), reset_basis: Some(QuotaResetBasis::Unknown),
             credits: Some(CreditAmounts { consumed: limits.overage_used, allowance: cap }), ..Default::default() });
     }
 }
 
 #[derive(Default)]
 struct Enrichment { until: u64, attempts: u32 }
+fn attach_api_identity(reading: &mut Reading, arn: &str) {
+    for w in &mut reading.windows {
+        if w.reading_transport != Some(QuotaReadingTransport::KiroUsageApi) { continue; }
+        w.quota_account_key = Some(quota_key(&("quota-account-v1", "kiro", arn)));
+        w.quota_bucket_key = Some(quota_key(&("quota-bucket-v1", "kiro", &w.id)));
+    }
+}
 fn backoff(attempt: u32, retry_after: u64) -> u64 { (60 * (1u64 << attempt.min(4))).max(retry_after).min(900) }
 impl Enrichment {
     fn enrich(&mut self, reading: &mut Reading) {
@@ -394,7 +673,10 @@ impl Enrichment {
                 use std::io::Read;
                 let mut body = String::new();
                 if r.into_reader().take((OUTPUT_LIMIT + 1) as u64).read_to_string(&mut body).is_ok() && body.len() <= OUTPUT_LIMIT {
-                    if let Some(limits) = serde_json::from_str(&body).ok().and_then(|v| parse_limits(&v)) { apply_limits(reading, limits); }
+                    if let Some(limits) = serde_json::from_str(&body).ok().and_then(|v| parse_limits(&v)) {
+                        apply_limits(reading, limits);
+                        attach_api_identity(reading, &arn);
+                    }
                 }
             }
             Err(ureq::Error::Status(429, r)) => {
@@ -412,40 +694,92 @@ fn from_result(prev: &UsageSnapshot, result: Result<Reading, ReadError>, enrichm
     match result {
         Ok(mut reading) => {
             enrichment.enrich(&mut reading);
+            if reading.windows.is_empty() { return from_result(prev, Err(ReadError::BadOutput), enrichment); }
             UsageSnapshot { status: "ok".into(), windows: reading.windows, fetched_at: now_ms(),
                 note: reading.plan.map(|p| format!("{p} · via Kiro CLI")).unwrap_or_else(|| "via Kiro CLI".into()),
                 backoff_until: enrichment.until }
         }
-        Err(ReadError::NeedsAuth) => UsageSnapshot { status: "needsAuth".into(), note: "Run kiro-cli login to see usage.".into(), ..Default::default() },
+        Err(ReadError::NeedsAuth) => {
+            let mut snap = prev.clone();
+            snap.status = if snap.windows.is_empty() { "needsAuth" } else { "stale" }.into();
+            snap.note = "Kiro sign-in required. Last reading retained.".into();
+            snap
+        }
         Err(error) => {
             let mut snap = prev.clone();
             snap.status = if snap.windows.is_empty() { "error" } else { "stale" }.into();
-            snap.note = match error { ReadError::TimedOut => "Kiro CLI /usage timed out", ReadError::BadOutput => "Kiro CLI reported no usable usage", _ => "Cannot run Kiro CLI /usage" }.into();
+            snap.note = match error { ReadError::TimedOut => "Kiro CLI /usage timed out", ReadError::BadOutput => "Kiro CLI reported no usable usage", ReadError::RateLimited => "Kiro CLI /usage rate limited", _ => "Cannot run Kiro CLI /usage" }.into();
             snap.backoff_until = enrichment.until;
             snap
         }
     }
 }
 
+fn resolved_error(error: Option<ReadError>, snapshot: &UsageSnapshot) -> Option<ReadError> {
+    error.or_else(|| (snapshot.status != "ok" || snapshot.windows.is_empty()).then_some(ReadError::BadOutput))
+}
+
+fn storage_pause(previous: &UsageSnapshot) -> UsageSnapshot {
+    let mut retained = previous.clone();
+    retained.status = if retained.windows.is_empty() { "error" } else { "stale" }.into();
+    retained.note = "Kiro polling paused: local retry state is unavailable. Repair local state and use Refresh to retry.".into();
+    retained
+}
+
 pub fn start(app: AppHandle) {
     std::thread::spawn(move || {
         let mut enrichment = Enrichment { until: app.state::<AppState>().kiro.lock().unwrap().backoff_until, ..Default::default() };
+        let dir = std::env::temp_dir().join("codenotch/kiro-usage");
+        let mut gate = load_poll_state(&poll_path());
+        let mut last_check = 0u64;
         loop {
-            let snap = if let Some(cli) = find_cli() {
-                let dir = std::env::temp_dir().join("codenotch/kiro-usage");
-                let result = std::fs::create_dir_all(&dir).map_err(|_| ReadError::Process)
-                    .and_then(|_| run_process(&cli, &ARGS, &dir, Duration::from_secs(20)))
-                    .and_then(|text| parse_cli(&text, Local::now()));
+            let manual = REFRESH.swap(false, Ordering::Relaxed);
+            let now = now_ms();
+            if manual || last_check == 0 || now < last_check || now.saturating_sub(last_check) >= 5000 {
+                last_check = now;
+                let old_gate = gate.clone();
+                let auth = observe_auth();
+                gate.observe(&auth, manual);
                 let previous = app.state::<AppState>().kiro.lock().unwrap().clone();
-                from_result(&previous, result, &mut enrichment)
-            } else { enrichment = Enrichment::default(); absent() };
-            *app.state::<AppState>().kiro.lock().unwrap() = snap.clone();
-            let _ = crate::agy_cli::save_persisted_to(&store_path(), &snap);
-            let _ = app.emit("kiro", &snap);
-            for _ in 0..300 {
-                if REFRESH.swap(false, Ordering::Relaxed) { break; }
-                std::thread::sleep(Duration::from_secs(1));
+                let mut snap = if let Some(cli) = find_cli() {
+                    if gate.storage_blocked && !manual {
+                        let retained = storage_pause(&previous);
+                        (retained.note != previous.note || retained.status != previous.status).then_some(retained)
+                    } else if gate.block_expired(&auth, manual, now) {
+                        let mut snap = from_result(&previous, Err(ReadError::NeedsAuth), &mut enrichment);
+                        snap.note = "Kiro credential expired; polling paused. Sign in externally or use Refresh. Last reading retained.".into();
+                        (previous.note != snap.note || previous.status != snap.status).then_some(snap)
+                    } else if gate.due(now, kiro_active(&dir, now)) {
+                        if gate.reserve_probe(&poll_path(), now).is_err() { Some(storage_pause(&previous)) }
+                        else {
+                            let result = std::fs::create_dir_all(&dir).map_err(|_| ReadError::Process)
+                                .and_then(|_| run_process(&cli, &ARGS, &dir, Duration::from_secs(20)))
+                                .and_then(|text| parse_cli(&text, Local::now()));
+                            let error = result.as_ref().err().copied();
+                            let mut snap = from_result(&previous, result, &mut enrichment);
+                            gate.record(now_ms(), resolved_error(error, &snap));
+                            // A busy auth database defers this observation, including across restarts.
+                            gate.observe(&observe_auth(), false);
+                            if gate.standby { snap.note.push_str(" Polling paused after 3 failures; sign in externally or use Refresh."); }
+                            else if gate.consecutive_failures > 0 { snap.note.push_str(&format!(" Attempt {}/3; retry in 30s.", gate.consecutive_failures)); }
+                            Some(snap)
+                        }
+                    } else { None }
+                } else {
+                    enrichment = Enrichment::default();
+                    (previous.status != "absent").then(absent)
+                };
+                if !gate.storage_blocked && old_gate != gate && save_poll_state(&poll_path(), &gate).is_err() {
+                    gate.standby = true; gate.storage_blocked = true;
+                    snap = Some(storage_pause(snap.as_ref().unwrap_or(&previous)));
+                }
+                if let Some(snap) = snap {
+                    *app.state::<AppState>().kiro.lock().unwrap() = snap.clone();
+                    let _ = crate::agy_cli::save_persisted_to(&store_path(), &snap);
+                    let _ = app.emit("kiro", &snap);
+                }
             }
+            std::thread::sleep(Duration::from_secs(1));
         }
     });
 }
@@ -459,6 +793,19 @@ pub fn probe() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn api_identity_is_attached_only_to_api_windows_not_preserved_cli_bonus() {
+        let mut reading=fixture("Plan: Q Developer Pro\nCredits (12.50 of 50 covered in plan)\n████ 25%\nBonus credits: 10/100 credits used, expires in 19 days");
+        let cli_bonus=reading.windows.iter().find(|w| w.id=="bonus").unwrap().clone();
+        apply_limits(&mut reading,parse_limits(&limits()).unwrap());
+        attach_api_identity(&mut reading,"arn:aws:codewhisperer:us-east-1:123:profile/synthetic");
+        let plan=reading.windows.iter().find(|w| w.id=="credits").unwrap();
+        assert!(plan.quota_account_key.is_some());
+        assert_eq!(plan.reading_transport,Some(QuotaReadingTransport::KiroUsageApi));
+        let bonus=reading.windows.iter().find(|w| w.id=="bonus").unwrap();
+        assert!(bonus.quota_account_key.is_none()); assert_eq!(bonus.used,cli_bonus.used);
+        assert_eq!(bonus.reading_transport,Some(QuotaReadingTransport::KiroCli));
+    }
     use super::*;
     use serde_json::json;
 
@@ -516,14 +863,27 @@ mod tests {
     }
 
     #[test]
-    fn reset_dates_use_local_civil_day_and_roll_to_next_year() {
+    fn reset_dates_use_utc_and_preserve_explicit_source_offsets() {
         let today = Local.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap();
         let reset = reset_stamp("01/15", today).unwrap();
-        assert_eq!(Local.timestamp_millis_opt(reset as i64).unwrap().year(), 2026);
+        assert_eq!(Utc.timestamp_millis_opt(reset as i64).unwrap(), Utc.with_ymd_and_hms(2026, 1, 15, 0, 0, 0).unwrap());
         let next = reset_stamp("01/14", today).unwrap();
-        assert_eq!(Local.timestamp_millis_opt(next as i64).unwrap().year(), 2027);
+        assert_eq!(Utc.timestamp_millis_opt(next as i64).unwrap(), Utc.with_ymd_and_hms(2027, 1, 14, 0, 0, 0).unwrap());
+        assert_eq!(reset_stamp("2026-11-01T00:00:00-03:00", today),
+            Some(Utc.with_ymd_and_hms(2026, 11, 1, 3, 0, 0).unwrap().timestamp_millis() as u64));
         assert!(reset_stamp("02/31", today).is_none());
         assert!(reset_stamp("2026-13-01", today).is_none());
+    }
+
+    #[test]
+    fn monthly_periods_use_real_calendar_lengths_only_at_utc_month_boundaries() {
+        let epoch = |year, month| Utc.with_ymd_and_hms(year, month, 1, 0, 0, 0).unwrap().timestamp_millis() as u64;
+        assert_eq!(monthly_duration_seconds(epoch(2026, 11)), Some(31 * 86400));
+        assert_eq!(monthly_duration_seconds(epoch(2027, 3)), Some(28 * 86400));
+        assert_eq!(monthly_duration_seconds(epoch(2028, 3)), Some(29 * 86400));
+        assert_eq!(monthly_duration_seconds(epoch(2026, 5)), Some(30 * 86400));
+        assert_eq!(monthly_duration_seconds(epoch(2026, 11) + 1), None);
+        assert_eq!(monthly_duration_seconds(u64::MAX), None);
     }
 
     #[test]
@@ -563,6 +923,8 @@ mod tests {
         assert_eq!(r.windows[2].used, 0.00025);
         assert_eq!(r.windows[0].credits.as_ref().unwrap().consumed, 3000.0);
         assert_eq!(r.windows[0].credits.as_ref().unwrap().allowance, 3000.0);
+        assert_eq!(r.windows[0].credit_scope, Some(CreditScope::Plan));
+        assert_eq!(r.windows[0].duration_seconds, Some(31 * 86400));
         assert_eq!(r.windows[1].credits.as_ref().unwrap().consumed, 5.0);
         assert_eq!(r.windows[2].credits.as_ref().unwrap().consumed, 0.25);
         assert_eq!(r.windows[2].credits.as_ref().unwrap().allowance, 1000.0);
@@ -572,6 +934,7 @@ mod tests {
         assert_eq!(r.windows[0].used, 0.8, "unseparated API bonus cannot replace CLI credits");
         assert_eq!(r.windows[0].credits.as_ref().unwrap().consumed, 0.17);
         assert_eq!(r.windows[0].credits.as_ref().unwrap().allowance, 50.0);
+        assert_eq!(r.windows[0].credit_scope, Some(CreditScope::Combined));
     }
 
     #[test]
@@ -639,13 +1002,296 @@ mod tests {
         let stale = from_result(&prev, Err(ReadError::TimedOut), &mut e);
         assert_eq!(stale.status, "stale"); assert_eq!(stale.fetched_at, 1);
         let signed_out = from_result(&prev, Err(ReadError::NeedsAuth), &mut e);
-        assert_eq!(signed_out.status, "needsAuth"); assert!(signed_out.windows.is_empty());
+        assert_eq!(signed_out.status, "stale"); assert_eq!(signed_out.windows[0].used, 0.25);
+        assert_eq!(signed_out.fetched_at, 1);
+        let empty = from_result(&UsageSnapshot::default(), Err(ReadError::NeedsAuth), &mut e);
+        assert_eq!(empty.status, "needsAuth"); assert!(empty.windows.is_empty());
         let current = from_result(&prev, Ok(fixture("Plan: KIRO FREE\n████ 10%")), &mut e);
         assert_eq!(current.status, "ok"); assert_eq!(current.windows[0].used, 0.1);
         let plan_only = from_result(&prev, Ok(fixture("Plan: Q Developer Pro")), &mut e);
-        assert!(plan_only.windows.is_empty());
+        assert_eq!(plan_only.status, "stale"); assert_eq!(plan_only.windows[0].used, 0.25);
+        assert_eq!(plan_only.fetched_at, 1);
         assert!(absent().windows.is_empty());
         assert_eq!(backoff(0, 0), 60); assert_eq!(backoff(3, 0), 480); assert_eq!(backoff(9, 3600), 900);
+    }
+
+    #[test]
+    fn process_failures_are_not_automatically_auth_failures() {
+        assert!(matches!(process_output(1, "", "network connection failed"), Err(ReadError::Process)));
+        assert!(matches!(process_output(1, "", "Login required"), Err(ReadError::NeedsAuth)));
+        assert!(matches!(process_output(0, "", "not logged in"), Err(ReadError::NeedsAuth)));
+        assert!(matches!(process_output(0, "", ""), Err(ReadError::BadOutput)));
+        assert_eq!(process_output(0, "Estimated Usage", "warning").unwrap(), "Estimated Usage");
+        assert!(matches!(process_output(1, "", "HTTP 429: too many requests"), Err(ReadError::RateLimited)));
+        assert_eq!(process_output(0, "Estimated Usage", "Rate limits are shown in this card").unwrap(), "Estimated Usage");
+        let card = "Estimated Usage\nRate limits: monthly credits";
+        assert_eq!(process_output(0, card, "").unwrap(), card);
+        for failure in ["Max rate limit exceeded", "Rate limit reached", "Rate limited", "HTTP429", "Too many requests"] {
+            assert!(matches!(process_output(0, "", failure), Err(ReadError::RateLimited)));
+        }
+    }
+
+    #[test]
+    fn polling_caps_all_failure_causes_and_success_reopens_budget() {
+        for cause in [ReadError::NeedsAuth, ReadError::TimedOut, ReadError::BadOutput, ReadError::Process, ReadError::RateLimited] {
+            let mut gate = PollState::default();
+            for attempt in 1..=3 {
+                assert!(gate.due(attempt * POLL_ACTIVE_MS, false));
+                gate.record(attempt * POLL_ACTIVE_MS, Some(cause));
+                assert_eq!(gate.consecutive_failures, attempt as u8);
+                assert_eq!(gate.last_failure, Some(cause));
+            }
+            for now in [POLL_IDLE_MS, u64::MAX] {
+                assert!(!gate.due(now, false)); assert!(!gate.due(now, true), "activity cannot leave standby");
+            }
+            gate.observe(&AuthObservation::default(), true);
+            assert!(gate.due(100_000, false));
+            gate.record(100_000, None);
+            assert_eq!(gate.consecutive_failures, 0); assert!(!gate.standby); assert!(gate.last_failure.is_none());
+        }
+        let mut mixed = PollState::default();
+        for cause in [ReadError::TimedOut, ReadError::Process, ReadError::NeedsAuth] { mixed.record(1, Some(cause)); }
+        assert!(mixed.standby, "changing error type cannot bypass the three-failure cap");
+    }
+
+    #[test]
+    fn standby_survives_restart_without_storing_credentials() {
+        let dir = scratch("poll-state"); let path = dir.join("kiro-poll.json");
+        let auth = auth_from_value(&json!({"accessToken":"fixture-sensitive-token", "expiresAt":2_000_000_000}));
+        let mut gate = PollState::default(); gate.observe(&auth, false);
+        for _ in 0..3 { gate.record(123, Some(ReadError::TimedOut)); }
+        save_poll_state(&path, &gate).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("fixture-sensitive-token"));
+        let mut restored = load_poll_state(&path);
+        assert!(restored.standby); assert_eq!(restored.consecutive_failures, 3);
+        restored.observe(&auth, false);
+        assert!(!restored.due(u64::MAX, true));
+        restored.observe(&auth, true);
+        assert!(restored.due(1000, false));
+        save_poll_state(&path, &restored).unwrap();
+        assert!(!load_poll_state(&path).standby);
+        std::fs::remove_file(path).unwrap(); std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_or_unreadable_local_state_fails_closed_until_explicit_repair() {
+        let dir = scratch("invalid-state"); let path = dir.join("kiro-poll.json");
+        assert!(!load_poll_state(&path).storage_blocked, "missing file is first use");
+        for raw in ["broken json", "{}", "[]", "{\"version\":1}"] {
+            std::fs::write(&path, raw).unwrap();
+            let mut gate = load_poll_state(&path);
+            assert!(gate.storage_blocked); assert!(gate.standby); assert!(!gate.due(u64::MAX, true));
+            gate.observe(&auth_from_value(&json!({"accessToken":"fixture-new-login"})), false);
+            assert!(gate.standby, "new auth cannot repair invalid retry state");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+            gate.observe(&AuthObservation::default(), true);
+            gate.reserve_probe(&path, 1).unwrap();
+            assert!(!gate.storage_blocked); assert!(!load_poll_state(&path).storage_blocked);
+        }
+        let complete = serde_json::to_value(PollState::default()).unwrap();
+        for key in ["version", "consecutive_failures", "standby", "last_failure", "auth_fingerprint", "last_attempt_ms"] {
+            let mut missing = complete.clone(); missing.as_object_mut().unwrap().remove(key);
+            std::fs::write(&path, missing.to_string()).unwrap(); assert!(load_poll_state(&path).storage_blocked);
+        }
+        let mut legacy = complete.clone(); legacy.as_object_mut().unwrap().remove("post_probe_observation_pending");
+        std::fs::write(&path, legacy.to_string()).unwrap(); assert!(!load_poll_state(&path).storage_blocked);
+        let mut cap = complete.clone(); cap["consecutive_failures"] = json!(3); cap["standby"] = json!(false);
+        std::fs::write(&path, cap.to_string()).unwrap(); assert!(load_poll_state(&path).standby);
+        cap["consecutive_failures"] = json!(4);
+        std::fs::write(&path, cap.to_string()).unwrap(); assert!(load_poll_state(&path).storage_blocked);
+        std::fs::remove_file(&path).unwrap(); std::fs::create_dir(&path).unwrap();
+        assert!(load_poll_state(&path).storage_blocked, "a directory is an unreadable state file");
+        std::fs::remove_dir(path).unwrap(); std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn blocked_state_writes_prevent_probes_even_after_refresh_and_restart() {
+        let dir = scratch("write-blocked"); let parent = dir.join("parent-is-file");
+        std::fs::write(&parent, "fixture").unwrap(); let path = parent.join("kiro-poll.json");
+        let mut gate = PollState::default();
+        assert!(gate.reserve_probe(&path, 1).is_err());
+        assert!(gate.storage_blocked); assert!(!gate.due(100_000, true));
+        gate.observe(&AuthObservation::default(), true);
+        assert!(gate.reserve_probe(&path, 2).is_err(), "manual retry still requires durable state");
+        assert!(!gate.due(100_000, true));
+        let mut restarted = load_poll_state(&path);
+        assert!(restarted.storage_blocked); assert!(!restarted.due(u64::MAX, false));
+        restarted.observe(&AuthObservation::default(), true);
+        assert!(restarted.reserve_probe(&path, 3).is_err());
+        std::fs::remove_file(parent).unwrap(); std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn durable_reservation_caps_incomplete_probes_across_restart() {
+        let dir = scratch("reservation"); let path = dir.join("kiro-poll.json");
+        for attempt in 1..=3 {
+            let mut gate = load_poll_state(&path);
+            assert!(gate.due(attempt, false));
+            gate.reserve_probe(&path, attempt).unwrap();
+            let restarted = load_poll_state(&path);
+            assert_eq!(restarted.consecutive_failures, attempt as u8);
+            assert!(restarted.post_probe_observation_pending);
+        }
+        assert!(!load_poll_state(&path).due(u64::MAX, true));
+        std::fs::remove_file(path).unwrap(); std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn deferred_own_refresh_observation_never_reopens_failure_budget() {
+        let dir = scratch("pending-auth"); let path = dir.join("kiro-poll.json");
+        let auth = |id: u64| auth_from_value(&json!({"accessToken":format!("fixture-{id}")}));
+        let mut gate = PollState::default(); gate.observe(&auth(1), false);
+        for attempt in 1..=3 {
+            gate.reserve_probe(&path, attempt).unwrap();
+            gate.record(attempt, Some(ReadError::NeedsAuth));
+            gate.observe(&AuthObservation::default(), false); // Auth database busy after own CLI refresh.
+            save_poll_state(&path, &gate).unwrap();
+            gate = load_poll_state(&path);
+            gate.observe(&auth(attempt + 1), false);
+            assert_eq!(gate.consecutive_failures, attempt as u8);
+            assert!(!gate.post_probe_observation_pending);
+        }
+        assert!(gate.standby); assert!(!gate.due(u64::MAX, true));
+        gate.observe(&auth(99), false);
+        assert!(!gate.standby, "subsequent observable external login reopens the gate");
+        gate.observe(&auth(99), true); assert!(gate.due(1, false));
+        std::fs::remove_file(path).unwrap(); std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn unchanged_post_probe_token_defers_late_own_refresh_without_resetting_cap() {
+        let dir = scratch("late-auth"); let path = dir.join("kiro-poll.json");
+        let auth = |id: u64| auth_from_value(&json!({"accessToken":format!("fixture-{id}")}));
+        let mut gate = PollState::default(); gate.observe(&auth(1), false);
+        for attempt in 1..=3 {
+            gate.reserve_probe(&path, attempt).unwrap();
+            gate.record(attempt, Some(ReadError::NeedsAuth));
+            gate.observe(&auth(attempt), false); // Post-probe read succeeds, but still sees pre-probe token.
+            assert!(gate.post_probe_observation_pending);
+            save_poll_state(&path, &gate).unwrap(); gate = load_poll_state(&path);
+            gate.observe(&auth(attempt + 1), false); // Late token change belongs to an ambiguous failed probe.
+            assert_eq!(gate.consecutive_failures, attempt as u8);
+        }
+        assert!(gate.standby); assert!(!gate.due(u64::MAX, true));
+        gate.observe(&auth(4), true); assert!(gate.due(1, false));
+        std::fs::remove_file(path).unwrap(); std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn only_observable_credential_change_or_manual_refresh_reopens_standby() {
+        let original = auth_from_value(&json!({"access_token":"fixture-one", "expires_at":"2026-11-01T00:00:00Z"}));
+        let unchanged = auth_from_value(&json!({"access_token":"fixture-one", "expires_at":"2026-11-01T00:00:00Z", "unrelated":"changed"}));
+        let changed = auth_from_value(&json!({"access_token":"fixture-two", "expires_at":"2026-11-01T00:00:00Z"}));
+        let mut gate = PollState::default(); gate.observe(&original, false);
+        for _ in 0..3 { gate.record(1, Some(ReadError::NeedsAuth)); }
+        gate.observe(&unchanged, false); assert!(gate.standby);
+        gate.observe(&AuthObservation::default(), false); assert!(gate.standby, "unreadable store is not new credentials");
+        gate.observe(&changed, false); assert!(!gate.standby); assert!(gate.due(2, false));
+        let mut unknown = PollState::default();
+        for _ in 0..3 { unknown.record(1, Some(ReadError::NeedsAuth)); }
+        unknown.observe(&original, false); assert!(unknown.standby, "first fingerprint is only a baseline");
+        unknown.observe(&changed, false); assert!(!unknown.standby);
+        // A refresh performed by our own CLI is remembered without resetting failures.
+        gate.record(3, Some(ReadError::NeedsAuth)); gate.auth_fingerprint = original.fingerprint.clone();
+        gate.observe(&original, false); assert_eq!(gate.consecutive_failures, 1);
+    }
+
+    #[test]
+    fn known_expiry_blocks_background_but_unknown_native_auth_remains_bounded() {
+        let now = 1_800_000_000_000u64;
+        for value in [json!({"accessToken":"fixture", "expiresAt":1_800_000_000}),
+            json!({"accessToken":"fixture", "expires_at_ms":now}),
+            json!({"accessToken":"fixture", "expires_at":"2026-01-01T00:00:00Z"})] {
+            let auth = auth_from_value(&value); let mut gate = PollState::default(); gate.observe(&auth, false);
+            assert!(gate.block_expired(&auth, false, now)); assert!(!gate.due(now, true));
+            assert_eq!(gate.consecutive_failures, 0, "preflight does not launch a failed probe");
+            gate.observe(&auth, true); assert!(!gate.block_expired(&auth, true, now)); assert!(gate.due(now, false));
+        }
+        for auth in [AuthObservation::default(), auth_from_value(&json!({"accessToken":"fixture"})),
+            auth_from_value(&json!({"accessToken":"fixture", "expiresAt":"unrecognized"})),
+            auth_from_value(&json!({"accessToken":"fixture", "expiresAt":1_900_000_000}))] {
+            let mut gate = PollState::default(); gate.observe(&auth, false);
+            assert!(!gate.block_expired(&auth, false, now)); assert!(gate.due(now, false));
+        }
+    }
+
+    #[test]
+    fn cadence_tracks_recent_messages_without_confusing_activity_with_login() {
+        let mut gate = PollState::default(); gate.record(1000, None);
+        assert!(!gate.due(1000 + POLL_ACTIVE_MS - 1, true));
+        assert!(gate.due(1000 + POLL_ACTIVE_MS, true));
+        assert!(!gate.due(1000 + POLL_ACTIVE_MS, false));
+        assert!(gate.due(1000 + POLL_IDLE_MS, false));
+        assert!(recent_activity(1000, 1000 + ACTIVITY_RECENT_MS));
+        assert!(!recent_activity(1000, 1000 + ACTIVITY_RECENT_MS + 1));
+        assert!(!recent_activity(1001, 1000));
+        for _ in 0..3 { gate.record(1000, Some(ReadError::Process)); }
+        assert!(!gate.due(1000 + POLL_IDLE_MS, true));
+    }
+
+    #[test]
+    fn sign_in_failure_preserves_last_official_two_percent_and_credit_pair() {
+        let prev = UsageSnapshot { status: "ok".into(), windows: fixture("Plan: KIRO POWER\n████ 2%\n(82.79 of 5000 covered in plan)").windows,
+            fetched_at: 1_800_000_000_000, ..Default::default() };
+        let mut enrichment = Enrichment { until: u64::MAX, ..Default::default() };
+        let stale = from_result(&prev, Err(ReadError::NeedsAuth), &mut enrichment);
+        assert_eq!(stale.status, "stale"); assert_eq!(stale.fetched_at, prev.fetched_at);
+        assert_eq!(stale.windows[0].used, 0.02);
+        assert_eq!(stale.windows[0].credits.as_ref().unwrap().consumed, 82.79);
+        assert_eq!(stale.windows[0].credits.as_ref().unwrap().allowance, 5000.0);
+        let saved = serde_json::to_vec(&stale).unwrap();
+        let restored: UsageSnapshot = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(restored.status, "stale"); assert_eq!(restored.windows[0].used, 0.02);
+    }
+
+    #[test]
+    fn plan_only_without_usable_enrichment_preserves_two_percent_and_consumes_budget() {
+        let prev = UsageSnapshot { status: "ok".into(), windows: fixture("Plan: KIRO POWER\n████ 2%\n(82.79 of 5000 covered in plan)").windows,
+            fetched_at: 123, ..Default::default() };
+        let mut enrichment = Enrichment { until: u64::MAX, ..Default::default() }; // No network, credentials or live enrichment.
+        let mut gate = PollState::default();
+        for attempt in 1..=3 {
+            let snapshot = from_result(&prev, Ok(fixture("Plan: Q Developer Pro")), &mut enrichment);
+            let error = resolved_error(None, &snapshot);
+            assert_eq!(error, Some(ReadError::BadOutput));
+            gate.record(attempt, error);
+            assert_eq!(snapshot.status, "stale"); assert_eq!(snapshot.fetched_at, 123);
+            assert_eq!(snapshot.windows[0].used, 0.02);
+            assert_eq!(snapshot.windows[0].credits.as_ref().unwrap().consumed, 82.79);
+        }
+        assert!(gate.standby); assert!(!gate.due(u64::MAX, true));
+        gate.observe(&AuthObservation::default(), true);
+        let mut enriched = fixture("Plan: Q Developer Pro");
+        apply_limits(&mut enriched, parse_limits(&limits()).unwrap());
+        let snapshot = from_result(&prev, Ok(enriched), &mut enrichment);
+        assert_eq!(snapshot.status, "ok"); assert!(!snapshot.windows.is_empty());
+        gate.record(4, resolved_error(None, &snapshot));
+        assert_eq!(gate.consecutive_failures, 0); assert!(!gate.standby);
+    }
+
+    #[test]
+    fn activity_uses_bounded_native_metadata_and_excludes_imports_and_poller() {
+        let dir = scratch("activity"); let root = dir.join("sessions");
+        let session = root.join("native/sess_fixture"); std::fs::create_dir_all(&session).unwrap();
+        let messages = session.join("messages.jsonl"); std::fs::write(&messages, "fixture\n").unwrap();
+        let metadata = session.join("session.json");
+        let now = std::fs::metadata(&messages).unwrap().modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        let poll = dir.join("kiro-usage");
+        std::fs::write(&metadata, json!({"rootPaths":[dir.join("project").to_string_lossy()]}).to_string()).unwrap();
+        assert!(recent_activity_at(&root, &poll, now));
+        assert!(!recent_activity_at(&root, &poll, now + ACTIVITY_RECENT_MS + 1));
+        std::fs::write(&metadata, json!({"rootPaths":[dir.join("project").to_string_lossy()],"_meta":{"sincronizarConversas":{}}}).to_string()).unwrap();
+        assert!(!recent_activity_at(&root, &poll, now));
+        std::fs::write(&metadata, json!({"rootPaths":[poll.to_string_lossy()]}).to_string()).unwrap();
+        assert!(!recent_activity_at(&root, &poll, now));
+        std::fs::write(&metadata, json!({"workspacePaths":[poll.join("child").to_string_lossy()]}).to_string()).unwrap();
+        assert!(!recent_activity_at(&root, &poll, now));
+        std::fs::write(&metadata, json!({"workspacePaths":[dir.join("project").to_string_lossy()]}).to_string()).unwrap();
+        assert!(recent_activity_at(&root, &poll, now));
+        std::fs::remove_file(messages).unwrap(); std::fs::remove_file(metadata).unwrap();
+        std::fs::remove_dir(session).unwrap(); std::fs::remove_dir(root.join("native")).unwrap();
+        std::fs::remove_dir(root).unwrap(); std::fs::remove_dir(dir).unwrap();
     }
 
     #[cfg(windows)]

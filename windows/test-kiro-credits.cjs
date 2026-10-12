@@ -6,11 +6,12 @@ const { test } = require('node:test');
 const source = readFileSync(join(__dirname, 'codenotch/ui/notch.html'), 'utf8');
 const amounts = source.split('// BEGIN TESTABLE CREDIT AMOUNTS')[1].split('// END TESTABLE CREDIT AMOUNTS')[0];
 const privacy = source.split('// BEGIN TESTABLE ACTIVITY PRIVACY')[1].split('// END TESTABLE ACTIVITY PRIVACY')[0];
+const insights = readFileSync(join(__dirname, 'codenotch/ui/usage-insights.js'), 'utf8');
 const pace = source.split('// BEGIN TESTABLE WORK PACE')[1].split('// END TESTABLE WORK PACE')[0];
 const tables = source.slice(source.indexOf('const UI='), source.indexOf('function textCopy('));
 function context(lang = 'pt-BR') {
   const c = vm.createContext({ uiLang: lang, Intl, esc: s => s });
-  vm.runInContext(tables + amounts + privacy + pace, c);
+  vm.runInContext(insights + tables + amounts + privacy + pace, c);
   return c;
 }
 const window = (consumed, allowance = 50) => ({ credits: { consumed, allowance } });

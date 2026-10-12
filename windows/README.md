@@ -25,7 +25,19 @@ documented behaviour and the wire formats.
 
 Providers that are not installed simply do not get a cell.
 
+### Test locally before a PR
+
+From the repository root, run `pwsh -NoProfile -File .\windows\scripts\build-local.ps1`.
+Add `-Installer` to generate the setup as well. The command runs the regression
+tests before compiling and keeps logs and artifact hashes. See
+[local build and manual validation](docs/local-build.md) for prerequisites and
+output paths. Test the local app before pushing the change for PR review.
+
 ### Kiro
+
+Quota reads now use a bounded [polling and standby policy](docs/kiro-polling.md):
+up to three consecutive failures, retained stale values, explicit refresh or an
+observable new credential to resume, and 30s active / 30min idle intervals.
 
 The hover card preserves both the official percentage and explicitly reported
 credits used/allowed. It does not estimate credits from a rounded percentage.
@@ -38,13 +50,18 @@ turning it back on adds it to the end. Hover activity is summarized by default:
 click the card or **Show details** to reveal session information. Closing the
 card or switching tools hides those details again.
 
-**General → Usage history** opens the configurable, shared consumption history.
+**Settings → History** opens the configurable, shared consumption history inside
+Settings. The tray also offers History and clickable quota indicators. **Usage**
+shows the same **Balance and deadline** view as the notch: available per working
+day, observed pace or clearly labeled cycle mean, and projected exhaustion versus
+the actual reset. Session and model-specific limits stay compact. Kiro displays
+explicit credits and their percentage of the confirmed monthly plan. Missing
+history leaves the forecast pending. Closing Settings keeps the collector running.
 First use asks for its destination and suggests Business OneDrive. Records and
 checkpoints are stored by collection machine and consolidated with deduplication.
 See [telemetry sources and recovery](docs/telemetry.md) and
-[working-day calendar](docs/work-calendar.md). The Codex weekly card can compare
-official quota with elapsed calendar time and elapsed working time; those time
-bars are derived references, not additional allowances.
+[working-day calendar](docs/work-calendar.md). Working time uses the full interval
+to each provider's reset, including partial days and configured holidays.
 
 ### Kiro CLI setup
 
@@ -61,8 +78,8 @@ a 20-second timeout. Its Windows JobObject is assigned before it resumes,
 and all children are terminated after completion or timeout. Both output
 streams are drained concurrently, with 64 KiB of retained text each. The
 CLI owns authentication and may perform its normal session refresh; Codenotch
-never writes its credentials. Reads run at startup, every five minutes and
-on explicit refresh. Switching off its ring uses the existing display setting.
+never writes its credentials. Reads follow the bounded polling policy above
+and explicit refresh. Switching off its ring uses the existing display setting.
 
 Optional enrichment reads `KIRO_DATA_DIR/data.sqlite3` when that absolute
 directory is set; otherwise it checks existing native `kiro-cli` databases
@@ -71,8 +88,8 @@ not a guarantee about every CLI version. The borrowed profile ARN selects
 only the upstream US East/Frankfurt service endpoints. API failures retain
 the CLI reading; HTTP 429 backs off enrichment alone. Plan-only CLI output
 shows no percentage, sign-out requests CLI login, and removing the CLI removes
-its cell even if a saved reading exists. Kiro activity/session detection is
-not provided by this adapter.
+its cell even if a saved reading exists. Recent local session writes control
+the polling cadence; they do not attribute the account balance to a project.
 
 Run `cargo test --locked` and `node --test test-kiro.cjs` from `windows/`.
 The regression fixtures do not use account credentials or inference.
@@ -169,9 +186,16 @@ shows an error or the last reading marked stale. Codenotch does not automate sig
 
 ## Install / build
 
-The fork has no published release yet; use the Windows CI build until its first release.
-Once published, download [`Codenotch-Setup.exe`](https://github.com/carlosbezerralopes/codenotch/releases/latest/download/Codenotch-Setup.exe)
-from the latest release. It installs for the current user without administrator rights, puts
+Download the [latest validated Windows development build (ZIP)](https://nightly.link/carlosbezerralopes/codenotch/workflows/windows-package.yml/feat%2Fkiro-windows/Codenotch-Windows.zip),
+unzip it and run `Codenotch-Setup.exe`. The fixed-name artifact follows successful
+push builds of this branch via nightly.link. The workflow runs UI/Rust tests and
+installer smoke checks before uploading it; failed builds do not replace it.
+The [Actions workflow](https://github.com/carlosbezerralopes/codenotch/actions/workflows/windows-package.yml)
+is the direct alternative. After merge, [main builds](https://nightly.link/carlosbezerralopes/codenotch/workflows/windows-package.yml/main/Codenotch-Windows.zip)
+follow that branch. CI artifacts may expire; this channel does not publish a stable release.
+
+An approved stable release can offer [`Codenotch-Setup.exe`](https://github.com/carlosbezerralopes/codenotch/releases/latest/download/Codenotch-Setup.exe).
+The installer installs for the current user without administrator rights, puts
 `codenotch-hook.exe` beside the app where **Install hooks** looks for it, and fetches WebView2 if
 Windows does not already have it. The installer is not code-signed, so SmartScreen stops it the
 first time with *Windows protected your PC*: choose **More info**, then **Run anyway**.

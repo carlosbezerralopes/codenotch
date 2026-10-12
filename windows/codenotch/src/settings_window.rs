@@ -4,7 +4,22 @@
 //! whether Mica is there to draw on, and the accent colour.
 
 use tauri::window::{Effect, EffectsBuilder};
-use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
+
+#[derive(Clone, PartialEq, Eq, serde::Serialize)]
+struct SettingsNavigation {
+    sequence: u64,
+    section: String,
+    provider: Option<String>,
+    window_index: Option<usize>,
+}
+static PENDING_NAVIGATION: std::sync::Mutex<Option<SettingsNavigation>> = std::sync::Mutex::new(None);
+static WINDOW_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static NAVIGATION_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn acknowledge_navigation(pending: &mut Option<SettingsNavigation>, delivered: &SettingsNavigation, ready: bool) {
+    if ready && pending.as_ref() == Some(delivered) { *pending = None; }
+}
 
 const LABEL: &str = "settings";
 /// Mica arrived with Windows 11's first build.
@@ -14,27 +29,59 @@ const FIRST_MICA_BUILD: u32 = 22000;
 /// deadlocks WebView2 and comes up blank, and asking `run_on_main_thread` from the main thread —
 /// where those commands run — builds it on the spot, so the request is posted from another thread.
 pub fn open(app: &AppHandle) {
+    open_request(app, None);
+}
+
+pub fn open_section(app: &AppHandle, section: &str, provider: Option<&str>, window_index: Option<usize>) {
+    if !matches!(section, "history" | "usage") { return; }
+    let provider = provider.filter(|id| matches!(*id, "claude" | "codex" | "kiro")).map(str::to_string);
+    let sequence = NAVIGATION_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+    let route = SettingsNavigation { sequence, section: section.into(), provider, window_index: window_index.filter(|n| *n < 4096) };
+    if let Ok(mut pending) = PENDING_NAVIGATION.lock() { *pending = Some(route.clone()); }
+    open_request(app, Some(route));
+}
+
+fn open_request(app: &AppHandle, route: Option<SettingsNavigation>) {
     let handle = app.clone();
     std::thread::spawn(move || {
         let app = handle.clone();
-        let _ = handle.run_on_main_thread(move || open_now(&app));
+        let _ = handle.run_on_main_thread(move || open_now(&app, route));
     });
 }
 
-fn open_now(app: &AppHandle) {
+fn open_now(app: &AppHandle, route: Option<SettingsNavigation>) {
+    if route.as_ref().is_some_and(|route| route.sequence != NAVIGATION_SEQUENCE.load(std::sync::atomic::Ordering::Acquire)) { return; }
     if let Some(w) = app.get_webview_window(LABEL) {
         let _ = w.unminimize();
         let _ = w.show();
         let _ = w.set_focus();
+        if let Some(route) = route {
+            if w.emit("settings_navigate", &route).is_ok() {
+                if let Ok(mut pending) = PENDING_NAVIGATION.lock() {
+                    acknowledge_navigation(&mut pending, &route, WINDOW_READY.load(std::sync::atomic::Ordering::Acquire));
+                }
+            }
+        }
         return;
     }
-    // The Mac's window: 680 × 520, centred, not resizable. `shadow` on an undecorated window is what
-    // gives it Windows 11's rounded corners.
-    let mut builder = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("settings.html".into()))
+    WINDOW_READY.store(false, std::sync::atomic::Ordering::Release);
+    if route.is_none() { if let Ok(mut pending) = PENDING_NAVIGATION.lock() { *pending = None; } }
+    // History tables need room; the original compact layout remains the minimum size.
+    let url = match route {
+        Some(route) => {
+            let mut url = format!("settings.html?section={}", route.section);
+            if let Some(provider) = route.provider { url.push_str(&format!("&provider={provider}")); }
+            if let Some(index) = route.window_index { url.push_str(&format!("&window_index={index}")); }
+            url
+        }
+        None => "settings.html".into(),
+    };
+    let mut builder = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App(url.into()))
         .title("Codenotch Settings")
-        .inner_size(680.0, 520.0)
-        .resizable(false)
-        .maximizable(false)
+        .inner_size(900.0, 680.0)
+        .min_inner_size(680.0, 520.0)
+        .resizable(true)
+        .maximizable(true)
         .decorations(false)
         .shadow(true)
         .center()
@@ -68,7 +115,31 @@ fn open_now(app: &AppHandle) {
 #[tauri::command]
 pub fn settings_ready(app: AppHandle) {
     if let Some(w) = app.get_webview_window(LABEL) {
+        WINDOW_READY.store(true, std::sync::atomic::Ordering::Release);
         reveal(&w);
+        if let Ok(mut pending) = PENDING_NAVIGATION.lock() {
+            if let Some(route) = pending.take() { let _ = w.emit("settings_navigate", route); }
+        }
+    }
+}
+
+#[cfg(test)]
+mod navigation_tests {
+    use super::*;
+    #[test]
+    fn ready_navigation_is_consumed_without_losing_a_newer_request() {
+        let first = SettingsNavigation { sequence: 1, section: "history".into(), provider: Some("codex".into()), window_index: None };
+        let next = SettingsNavigation { sequence: 2, section: "usage".into(), provider: Some("kiro".into()), window_index: Some(0) };
+        let mut pending = Some(first.clone());
+        acknowledge_navigation(&mut pending, &first, false);
+        assert!(pending.is_some());
+        acknowledge_navigation(&mut pending, &first, true);
+        assert!(pending.is_none());
+        pending = Some(next.clone());
+        acknowledge_navigation(&mut pending, &first, true);
+        assert!(pending.as_ref() == Some(&next));
+        acknowledge_navigation(&mut pending, &next, true);
+        assert!(pending.is_none());
     }
 }
 

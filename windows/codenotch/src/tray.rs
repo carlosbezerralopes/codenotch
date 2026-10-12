@@ -13,7 +13,7 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
         builder = builder.icon(icon);
     }
     builder
-        .tooltip(concat!("Codenotch v", env!("CARGO_PKG_VERSION")))
+        .tooltip(tooltip(app))
         .menu(&menu)
         .show_menu_on_left_click(true)
         .on_menu_event(|app, ev| handle(app, ev.id().as_ref()))
@@ -29,6 +29,12 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
 /// menu so a refresh can tell whether anything visible changed before it swaps the menu out.
 fn menu_lines(app: &AppHandle, lang: &str) -> Vec<(String, String, bool)> {
     let now = crate::now_ms();
+    let calendar = crate::work_calendar::get_calendar_settings().ok();
+    let (limit, model) = {
+        let st = app.state::<crate::AppState>();
+        let cfg = st.cfg.lock().unwrap();
+        (cfg.antigravity_limit.clone(), cfg.antigravity_model.clone())
+    };
     let mut lines = Vec::new();
     for id in crate::provider_ids_in_order(app) {
         let snap = crate::snapshot_of(app, id);
@@ -37,17 +43,27 @@ fn menu_lines(app: &AppHandle, lang: &str) -> Vec<(String, String, bool)> {
         }
         let head = traymenu::header(
             &crate::provider_display_name(app, id),
-            crate::ring_fraction(app, id),
+            crate::ring_window(id, &snap.windows, &limit, &model).filter(|w| w.count.is_none()).map(|w| w.used.clamp(0.0, 1.0)),
             traymenu::stale_since(&snap, now),
             now,
             lang,
         );
-        // Clicking a provider re-reads that one, as on the Mac.
-        lines.push((format!("refresh:{id}"), head, true));
+        lines.push((format!("header:{id}"), head, false));
+        let insights = crate::provider_insights_from_snapshot(app, id, &snap, calendar.as_ref(), now);
         for (n, line) in traymenu::provider_lines(&snap, now, lang).iter().enumerate() {
             // Windows does not indent submenu-less items, so the indent is in the text.
-            lines.push((format!("line:{id}:{n}"), format!("    {line}"), false));
+            let insight = if matches!(id, "claude" | "codex" | "kiro") {
+                snap.windows.get(n).and_then(|source| traymenu::matching_insight(&insights, source, n))
+            } else { None };
+            let supported = insight.is_some();
+            lines.push((if supported { format!("insight:{id}:{n}") } else { format!("line:{id}:{n}") }, format!("    {line}"), supported));
+            if let Some(window) = insight {
+                for (detail_index, detail) in traymenu::insight_lines(window, lang).into_iter().enumerate() {
+                    lines.push((format!("detail:{id}:{n}:{detail_index}"), format!("        {detail}"), false));
+                }
+            }
         }
+        lines.push((format!("refresh:{id}"), format!("{}: {}", tr(lang, "refresh_all"), crate::provider_display_name(app, id)), true));
     }
     lines
 }
@@ -72,6 +88,7 @@ fn build_menu_from(app: &AppHandle, lang: &str, lines: &[(String, String, bool)]
     }
     let refresh = MenuItemBuilder::with_id("refresh", tr(&lang, "refresh_all")).build(app)?;
     let settings = MenuItemBuilder::with_id("settings", tr(&lang, "settings")).build(app)?;
+    let history = MenuItemBuilder::with_id("history", if lang == "pt-BR" { "Histórico" } else { "History" }).build(app)?;
     let quit = MenuItemBuilder::with_id("quit", tr(&lang, "quit_app")).build(app)?;
     let mut menu = MenuBuilder::new(app);
     for item in &items {
@@ -80,6 +97,7 @@ fn build_menu_from(app: &AppHandle, lang: &str, lines: &[(String, String, bool)]
     menu.separator()
         .item(&refresh)
         .item(&settings)
+        .item(&history)
         .separator()
         .item(&quit)
         .build()
@@ -99,20 +117,34 @@ pub(crate) fn language(app: &AppHandle) -> String {
 
 /// The hover text: the same figures the menu opens with, for when the menu is not open.
 fn tooltip(app: &AppHandle) -> String {
+    let now = crate::now_ms();
+    let calendar = crate::work_calendar::get_calendar_settings().ok();
+    let lang = language(app);
+    let (limit, model) = {
+        let st = app.state::<crate::AppState>();
+        let cfg = st.cfg.lock().unwrap();
+        (cfg.antigravity_limit.clone(), cfg.antigravity_model.clone())
+    };
     let mut parts: Vec<String> = Vec::new();
     for id in crate::provider_ids_in_order(app) {
-        if crate::snapshot_of(app, id).status == "absent" {
+        let snap = crate::snapshot_of(app, id);
+        if snap.status == "absent" {
             continue;
         }
-        let value = crate::ring_fraction(app, id)
+        let headline = crate::ring_window(id, &snap.windows, &limit, &model).filter(|w| w.count.is_none());
+        let value = headline.map(|w| w.used.clamp(0.0, 1.0))
             .map(|f| format!("{}%", traymenu::pct(f)))
             .unwrap_or_else(|| "—".into());
-        parts.push(format!("{} {value}", crate::provider_display_name(app, id)));
+        let dto = crate::provider_insights_from_snapshot(app, id, &snap, calendar.as_ref(), now);
+        let detail = dto.windows.iter().find(|w| w.quota_role == Some(crate::usage_insights::QuotaRole::General))
+            .and_then(|w| traymenu::insight_tooltip(w, &lang))
+            .map(|text| format!(" · {text}")).unwrap_or_default();
+        parts.push(format!("{} {value}{detail}", crate::provider_display_name(app, id)));
     }
     if parts.is_empty() {
         concat!("Codenotch v", env!("CARGO_PKG_VERSION")).to_string()
     } else {
-        format!("Codenotch — {}", parts.join(" · "))
+        traymenu::bounded_tooltip(&format!("Codenotch — {}", parts.join(" · ")))
     }
 }
 
@@ -157,6 +189,10 @@ pub fn refresh_menu(app: &AppHandle) {
 /// Provider rows carry `refresh:<id>`; everything else the menu offers is one of the four fixed
 /// items. Settings, language, hooks and the rest arrive as commands from the settings window.
 fn handle(app: &AppHandle, id: &str) {
+    if let Some((provider, index)) = traymenu::insight_target(id) {
+        crate::settings_window::open_section(app, "usage", Some(provider), Some(index));
+        return;
+    }
     if let Some(provider) = id.strip_prefix("refresh:") {
         crate::refresh_provider(app, provider);
         return;
@@ -164,6 +200,7 @@ fn handle(app: &AppHandle, id: &str) {
     match id {
         "refresh" => crate::refresh_all(app),
         "settings" => crate::settings_window::open(app),
+        "history" => crate::settings_window::open_section(app, "history", None, None),
         "quit" => app.exit(0),
         _ => {}
     }

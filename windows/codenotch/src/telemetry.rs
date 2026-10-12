@@ -1,6 +1,8 @@
 //! Local, numeric telemetry. Agent sources are read-only; durable batches precede cursors.
 mod collector;
 mod parsers;
+mod quota_journal;
+pub(crate) mod quota_index;
 mod store;
 
 use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, Utc};
@@ -93,6 +95,7 @@ pub struct TelemetryService {
     settings: TelemetrySettings, config_path: PathBuf, cache_path: PathBuf,
     dataset: store::Dataset, coverage: Vec<Coverage>, issues: Vec<String>, last_scan_at: Option<String>,
     scan_next: usize, invalid_config: bool,
+    quota_index: quota_index::QuotaIndex,
 }
 impl TelemetryService {
     /// Reads only this app's settings. No discovery, dataset writes or agent reads before selection.
@@ -109,7 +112,9 @@ impl TelemetryService {
         } else { TelemetrySettings::default() };
         settings.suggested_directory = suggested_directory();
         if settings.writer_id.is_empty() { settings.writer_id = unique_id(); }
-        let mut service=Self { settings, config_path, cache_path, dataset: store::Dataset::default(), coverage: vec![], issues: initial_issues, last_scan_at: None, scan_next: 0,invalid_config };
+        let quota_index = quota_index::QuotaIndex::new(cache_path.with_file_name("quota-rate-cache.sqlite"));
+        let mut service=Self { settings, config_path, cache_path, dataset: store::Dataset::default(), coverage: vec![], issues: initial_issues, last_scan_at: None, scan_next: 0,invalid_config, quota_index };
+        service.quota_index.set_root(if service.settings.enabled { service.settings.export_directory.as_deref() } else { None });
         if let Some(path)=service.settings.export_directory.as_ref(){
             match store::load(Path::new(path),&service.cache_path,&mut service.issues){Ok(dataset)=>service.dataset=dataset,Err(error)=>service.issues.push(error)}
         }
@@ -143,16 +148,49 @@ impl TelemetryService {
         store::atomic_file(&self.config_path, &serde_json::to_vec_pretty(&settings).map_err(|e| e.to_string())?, true)?;
         let persisted: TelemetrySettings = serde_json::from_slice(&std::fs::read(&self.config_path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         self.settings = persisted; self.dataset = dataset; self.issues = issues; self.coverage.clear(); self.last_scan_at = None; self.scan_next = 0;self.invalid_config=false;
+        self.quota_index.set_root(if self.settings.enabled { self.settings.export_directory.as_deref() } else { None });
         Ok(self.settings())
     }
     pub fn scan(&mut self) -> Result<(), String> {
         if !self.settings.enabled || self.settings.export_directory.is_none() { return Ok(()); }
         let dir = PathBuf::from(self.settings.export_directory.as_ref().unwrap());
-        self.issues.clear();
+        // A failed quota commit remains visible even while stale sources are skipped.
+        // Only a successful quota retry (or explicit configure) clears that provider's error.
+        self.issues.retain(|issue| issue.starts_with("Quota journal ("));
         self.dataset = match store::load(&dir, &self.cache_path, &mut self.issues) {Ok(dataset)=>dataset,Err(error)=>{self.issues.push(error.clone());return Err(error);}};
         self.coverage = match collector::scan(&self.settings, &dir, &mut self.dataset, &mut self.scan_next, &mut self.issues){Ok(coverage)=>coverage,Err(error)=>{self.issues.push(error.clone());return Err(error);}};
         self.last_scan_at = Some(Utc::now().to_rfc3339());
         Ok(())
+    }
+    /// Official quota snapshots are a separate journal; they never add usage events.
+    pub fn record_quota_reading(
+        &mut self,
+        provider: &str,
+        snapshot: &crate::usage::UsageSnapshot,
+        insights: &crate::usage_insights::ProviderInsights,
+    ) -> Result<(), String> {
+        self.ingest_quota_snapshot(provider, snapshot, insights);
+        let prefix = format!("Quota journal ({provider}): ");
+        self.issues.retain(|issue| !issue.starts_with(&prefix));
+        if let Some(path) = quota_journal::owned_v2_path(&self.settings, provider, snapshot) { self.quota_index.note_owned_write(path); }
+        let result = quota_journal::record(&self.settings, provider, snapshot, insights);
+        if let Err(error) = &result { self.issues.push(format!("{prefix}{error}")); }
+        result
+    }
+    pub(crate) fn ingest_quota_snapshot(&mut self, provider: &str, snapshot: &crate::usage::UsageSnapshot,
+        base: &crate::usage_insights::ProviderInsights) {
+        self.quota_index.ingest(provider, snapshot, base);
+    }
+    pub(crate) fn quota_rate_history(&self, requests: &[quota_index::QuotaHistoryRequest])
+        -> std::collections::HashMap<usize, quota_index::QuotaHistoryResult> {
+        self.quota_index.history(requests)
+    }
+    pub(crate) fn take_quota_index_refresh(&mut self) -> Option<quota_index::QuotaIndex> {
+        if !self.settings.enabled { return None; }
+        self.quota_index.take_refresh()
+    }
+    pub(crate) fn finish_quota_index_refresh(&mut self, completed: quota_index::QuotaIndex, issues: Vec<String>) {
+        if self.quota_index.finish_refresh(completed) { self.issues.extend(issues); }
     }
     pub fn report(&self, query: TelemetryQuery) -> TelemetryReport {
         let mut report = TelemetryReport { configured: self.settings.export_directory.is_some(), enabled: self.settings.enabled,

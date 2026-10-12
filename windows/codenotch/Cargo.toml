@@ -1,6 +1,6 @@
 [package]
 name = "codenotch"
-version = "1.22.1"
+version = "1.22.3"
 edition = "2021"
 description = "Codenotch for Windows — assistant quotas, Kiro credits and local usage history"
 license = "MIT"
@@ -18,7 +18,7 @@ tauri-plugin-single-instance = "2"
 # both are in the binary either way.) zip: the NSIS updater artifact is zipped.
 tauri-plugin-updater = { version = "2", default-features = false, features = ["native-tls", "zip"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 sha2 = "0.10"
 semver = "1"
 tiny_http = "0.12"

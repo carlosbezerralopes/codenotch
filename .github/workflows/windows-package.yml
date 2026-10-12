@@ -6,7 +6,7 @@ name: Windows Package
 # Windows file at all.
 on:
   push:
-    branches: [main]
+    branches: [main, 'feat/kiro-windows']
     paths:
       - 'windows/**'
       - '.github/workflows/windows-package.yml'
@@ -40,6 +40,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: windows
+
+      # The stable build link must only offer installers that passed these checks.
+      - name: Validate the Windows build before distribution
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          node scripts/check-ui-scripts.mjs
+          node --check codenotch/ui/usage-insights.js
+          node --test test-*.cjs scripts/test-*.cjs
+          cargo test --locked
 
       # Its own target dir for two reasons. The bundler copies resources next to
       # the app in target/release, so a hook built there would be copied onto
@@ -122,6 +132,14 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: Codenotch-Setup-${{ github.sha }}
+          path: windows/Codenotch-Setup.exe
+          if-no-files-found: error
+
+      - name: Publish the fixed-name CI download
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v7
+        with:
+          name: Codenotch-Windows
           path: windows/Codenotch-Setup.exe
           if-no-files-found: error
 
