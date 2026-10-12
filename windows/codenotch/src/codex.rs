@@ -279,6 +279,12 @@ fn reset_at_ms(w: &serde_json::Value, now: u64, epoch_key: &str, delay_key: &str
         .or_else(|| num(w.get(delay_key)).and_then(secs_to_ms).map(|ms| now.saturating_add(ms)))
 }
 
+fn duration_seconds(value: Option<f64>, multiplier: f64) -> Option<u64> {
+    let seconds = value? * multiplier;
+    (seconds.is_finite() && seconds > 0.0 && seconds <= 366.0 * 86400.0
+        && seconds.fract() == 0.0).then_some(seconds as u64)
+}
+
 /// Skip a window with no `used_percent`. Extra ids still pass primary/secondary to `label_for`.
 fn window_from(
     w: &serde_json::Value,
@@ -296,6 +302,7 @@ fn window_from(
         label: label_for(num(w.get("limit_window_seconds")).map(|s| s / 60.0), fallback),
         used: (pct / 100.0).clamp(0.0, 1.0),
         resets_at: reset_at_ms(w, now, "reset_at", "reset_after_seconds"),
+        duration_seconds: duration_seconds(num(w.get("limit_window_seconds")), 1.0),
         group: group.map(str::to_string),
         ..Default::default()
     })
@@ -504,6 +511,7 @@ pub fn snapshot_from_rollout(text: &str) -> Option<(Vec<LimitWindow>, Option<u64
                 label: label_for(num(w.get("window_minutes")), id),
                 used: (pct / 100.0).clamp(0.0, 1.0),
                 resets_at: reset_at_ms(w, now, "resets_at", "resets_in_seconds"),
+                duration_seconds: duration_seconds(num(w.get("window_minutes")), 60.0),
                 ..Default::default()
             });
         }
@@ -550,6 +558,7 @@ fn app_server_snapshot(result: &serde_json::Value) -> Option<UsageSnapshot> {
             label: label_for(w.get("windowDurationMins").and_then(|x| x.as_f64()), id),
             used: (used / 100.0).clamp(0.0, 1.0),
             resets_at: w.get("resetsAt").and_then(|x| x.as_u64()).map(|s| s.saturating_mul(1000)),
+            duration_seconds: duration_seconds(w.get("windowDurationMins").and_then(|x| x.as_f64()), 60.0),
             ..Default::default()
         });
     }
@@ -790,6 +799,20 @@ pub fn probe() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn duration_is_preserved_from_all_transports_without_guessing_from_ids() {
+        let http=window_from(&serde_json::json!({"used_percent":1,"limit_window_seconds":604800}),"primary","primary",0,None).unwrap();
+        assert_eq!(http.duration_seconds,Some(604800));
+        let rollout=snapshot_from_rollout(r#"{"rate_limits":{"secondary":{"used_percent":1,"window_minutes":10080}}}"#).unwrap();
+        assert_eq!(rollout.0[0].duration_seconds,Some(604800));
+        let native=app_server_snapshot(&serde_json::json!({"rateLimits":{"primary":{"usedPercent":1,"windowDurationMins":43200}}})).unwrap();
+        assert_eq!(native.windows[0].duration_seconds,Some(2592000));
+        let missing=window_from(&serde_json::json!({"used_percent":1}),"secondary","secondary",0,None).unwrap();
+        assert_eq!(missing.duration_seconds,None);
+        for value in [None,Some(-1.0),Some(0.0),Some(f64::NAN),Some(f64::INFINITY),Some(0.1)] {
+            assert_eq!(duration_seconds(value,1.0),None);
+        }
+    }
     use super::*;
 
     #[test]

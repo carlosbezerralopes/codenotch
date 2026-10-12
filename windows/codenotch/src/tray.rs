@@ -30,13 +30,13 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
 fn menu_lines(app: &AppHandle, lang: &str) -> Vec<(String, String, bool)> {
     let now = crate::now_ms();
     let mut lines = Vec::new();
-    for id in crate::TRAY_PROVIDER_IDS {
+    for id in crate::provider_ids_in_order(app) {
         let snap = crate::snapshot_of(app, id);
         if snap.status == "absent" {
             continue;
         }
         let head = traymenu::header(
-            crate::provider_label(id),
+            &crate::provider_display_name(app, id),
             crate::ring_fraction(app, id),
             traymenu::stale_since(&snap, now),
             now,
@@ -100,14 +100,14 @@ pub(crate) fn language(app: &AppHandle) -> String {
 /// The hover text: the same figures the menu opens with, for when the menu is not open.
 fn tooltip(app: &AppHandle) -> String {
     let mut parts: Vec<String> = Vec::new();
-    for id in crate::TRAY_PROVIDER_IDS {
+    for id in crate::provider_ids_in_order(app) {
         if crate::snapshot_of(app, id).status == "absent" {
             continue;
         }
         let value = crate::ring_fraction(app, id)
             .map(|f| format!("{}%", traymenu::pct(f)))
             .unwrap_or_else(|| "—".into());
-        parts.push(format!("{} {value}", crate::provider_label(id)));
+        parts.push(format!("{} {value}", crate::provider_display_name(app, id)));
     }
     if parts.is_empty() {
         concat!("Codenotch v", env!("CARGO_PKG_VERSION")).to_string()

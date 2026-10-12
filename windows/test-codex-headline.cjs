@@ -32,10 +32,27 @@ test('Missing Codex primary stays blank, never replaced by weekly or extra quota
   assert.equal(pick([{ id: 'spark' }, { id: 'code-review' }]), null);
   assert.equal(pick([]), null);
 });
-test('Codex secondary remains available to the separate weekly ring', () => {
-  const windows = [{ id: 'spark' }, { id: 'secondary', used: 0.8 }];
+test('Codex reported secondary week remains available to the separate weekly ring', () => {
+  const windows = [{ id: 'spark' }, { id: 'primary', duration_seconds: 18000 }, { id: 'secondary', used: 0.8, duration_seconds: 604800 }];
   assert.equal(context.weeklyOf({ windows }, 'codex').id, 'secondary');
   assert.equal(context.weeklyOf({ windows: [{ id: 'primary' }] }, 'codex'), null);
+});
+
+test('A primary week stays the headline and is never duplicated as a thin weekly ring', () => {
+  const windows = [{ id: 'primary', duration_seconds: 604800 }, { id: 'secondary', duration_seconds: 2592000 }];
+  assert.equal(pick(windows), 'primary');
+  assert.equal(context.weeklyOf({ windows }, 'codex'), null);
+  assert.equal(context.weeklyOf({ windows: [{ id: 'primary', duration_seconds: 604800 }, { id: 'secondary', duration_seconds: 604800 }] }, 'codex'), null);
+});
+
+test('Secondary is not automatically a week: monthly or unknown durations never invent a weekly ring', () => {
+  for (const duration_seconds of [2592000, undefined, null, 0, 18000, '604800']) {
+    const windows = [{ id: 'primary', duration_seconds: 18000 }, { id: 'secondary', label: 'Weekly', duration_seconds }, { id: 'spark', duration_seconds: 604800 }];
+    assert.equal(context.weeklyOf({ windows }, 'codex'), null);
+    assert.equal(pick(windows), 'primary');
+  }
+  assert.equal(context.weeklyOf({ windows: [{ id: 'secondary', duration_seconds: 604800 }] }, 'codex').id, 'secondary');
+  assert.equal(pick([{ id: 'secondary', duration_seconds: 604800 }]), null, 'the headline never falls back');
 });
 test('Marker extraction does not depend on neighbouring function order', () => {
   const block = `// BEGIN TESTABLE HEADLINE SELECTOR\n${markedSource(html, 'HEADLINE')}\n// END TESTABLE HEADLINE SELECTOR`;

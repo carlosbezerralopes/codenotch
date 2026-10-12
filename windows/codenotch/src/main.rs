@@ -23,6 +23,7 @@ mod copilot;
 mod antigravity;
 mod glm;
 mod opencode;
+mod kiro;
 mod agy_cli;
 mod glyphs;
 mod trayicon;
@@ -31,17 +32,21 @@ mod diag;
 mod carry;
 mod watcher;
 mod settings_window;
+mod telemetry;
+mod telemetry_window;
+mod telemetry_picker;
+mod work_calendar;
 mod topmost;
 mod updater;
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
 
 /// Logical size of the notch window: the 70 pt pill column on the right plus room for the hover card
 /// and its tail on the left. `fitZoom` in ui/notch.html divides by the same width.
 pub const NOTCH_W: f64 = 360.0;
 /// Hand-bumped build tag, written to run.log at startup so a log can always be matched to the exe that wrote it.
-pub const BUILD: &str = "r33";
+pub const BUILD: &str = "r34";
 /// The notch window's long side: the upright window's height, and both sides of the flat one.
 ///
 /// Five cells make a 447 px pill; its fillets add 38.7 px at each end and the settings orb reaches
@@ -67,10 +72,12 @@ pub struct AppState {
     pub glm: Mutex<usage::UsageSnapshot>,
     /// OpenCode Go plan snapshot, read with OpenCode's own sign-in (auth.json or opencode.db).
     pub opencode: Mutex<usage::UsageSnapshot>,
+    pub kiro: Mutex<usage::UsageSnapshot>,
     /// Provider glyph cache, collected at launch and again on a tray refresh
     pub glyphs: Mutex<std::collections::HashMap<String, glyphs::Glyph>>,
     /// Working state of the non-Claude providers (Cursor reports it; Codex and Antigravity are inferred from recent writes)
     pub activity: Mutex<Vec<activity::Activity>>,
+    pub telemetry: Option<Arc<Mutex<telemetry::TelemetryService>>>,
 }
 
 fn resolved_lang(raw: &str) -> String {
@@ -504,6 +511,7 @@ pub(crate) fn refresh_provider(app: &AppHandle, provider: &str) -> bool {
         "gemini" => antigravity::request_refresh(),
         "glm" => glm::request_refresh(),
         "opencode" => opencode::request_refresh(),
+        "kiro" => kiro::request_refresh(),
         _ => return false,
     }
     true
@@ -536,6 +544,11 @@ fn get_glm(state: tauri::State<AppState>) -> usage::UsageSnapshot {
 #[tauri::command]
 fn get_opencode(state: tauri::State<AppState>) -> usage::UsageSnapshot {
     state.opencode.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn get_kiro(state: tauri::State<AppState>) -> usage::UsageSnapshot {
+    state.kiro.lock().unwrap().clone()
 }
 
 #[tauri::command]
@@ -604,6 +617,7 @@ pub(crate) fn provider_page(provider: &str) -> Option<(&'static str, &'static st
         "gemini" => ("https://antigravity.google", "antigravity.google"),
         "glm" => ("https://z.ai/manage-apikey/apikey-list", "z.ai"),
         "opencode" => ("https://opencode.ai", "opencode.ai"),
+        "kiro" => ("https://app.kiro.dev/account/usage", "app.kiro.dev"),
         _ => return None,
     })
 }
@@ -966,7 +980,7 @@ fn get_theme_resolved(app: AppHandle) -> String {
 /// rather than left dark under a light page.
 pub fn apply_theme(app: &AppHandle) {
     let theme = theme_choice(app);
-    for label in ["notch", "settings"] {
+    for label in ["notch", "settings", "telemetry"] {
         if let Some(w) = app.get_webview_window(label) {
             let _ = w.set_theme(theme);
         }
@@ -1164,6 +1178,7 @@ fn ring_window<'a>(
         "glm" => by_id("session"),
         // The Mac sets headlineID "rolling", weeklyID "weekly".
         "opencode" => by_id("rolling"),
+        "kiro" => by_id("credits"),
         _ => antigravity_lane(windows, antigravity_limit, antigravity_model),
     }
 }
@@ -1222,6 +1237,7 @@ pub(crate) fn snapshot_of(app: &AppHandle, id: &str) -> usage::UsageSnapshot {
         "gemini" => st.antigravity.lock().unwrap().clone(),
         "glm" => st.glm.lock().unwrap().clone(),
         "opencode" => st.opencode.lock().unwrap().clone(),
+        "kiro" => st.kiro.lock().unwrap().clone(),
         _ => st.usage.lock().unwrap().clone(),
     }
 }
@@ -1269,11 +1285,11 @@ struct TrayOption {
 
 #[tauri::command]
 fn get_tray_options(app: AppHandle) -> Vec<TrayOption> {
-    TRAY_PROVIDER_IDS
-        .iter()
+    provider_ids_in_order(&app)
+        .into_iter()
         .map(|id| TrayOption {
-            id: (*id).to_string(),
-            label: provider_label(id).to_string(),
+            id: id.to_string(),
+            label: provider_display_name(&app, id),
             status: snapshot_of(&app, id).status,
             used: ring_pct(&app, id),
         })
@@ -1323,18 +1339,79 @@ fn get_notch_slots(app: AppHandle) -> Vec<config::TraySlot> {
 }
 
 #[tauri::command]
-fn set_notch_slots(app: AppHandle, slots: Vec<config::TraySlot>) {
+fn set_notch_slots(app: AppHandle, slots: Vec<config::TraySlot>) -> Result<Vec<config::TraySlot>, String> {
     let list = {
         let st = app.state::<AppState>();
         let mut c = st.cfg.lock().unwrap();
-        c.notch_slots = slots;
+        let mut next = c.clone();
+        next.notch_slots = slots;
         // Kept in step so an older build reading this file still shows the right providers
-        c.notch_providers = c.notch_slots.iter().map(|s| s.provider.clone()).collect();
-        config::save(&c);
+        next.notch_providers = next.notch_slots.iter().map(|s| s.provider.clone()).collect();
+        config::save_checked(&next)?;
+        *c = next;
         c.notch_slots.clone()
     };
     // The notch is a separate window and draws its own cells, so it has to be told.
-    let _ = app.emit("notch_slots", list);
+    let _ = app.emit("notch_slots", &list);
+    Ok(list)
+}
+
+#[tauri::command]
+fn get_provider_order(app: AppHandle) -> Vec<String> {
+    let st = app.state::<AppState>();
+    let order = st.cfg.lock().unwrap().provider_order.clone();
+    order
+}
+
+#[tauri::command]
+fn set_provider_order(app: AppHandle, order: Vec<String>) -> Result<Vec<String>, String> {
+    if order.iter().any(|id| !TRAY_PROVIDER_IDS.contains(&id.as_str())) {
+        return Err("Unknown provider identity".into());
+    }
+    let order = {
+        let st = app.state::<AppState>();
+        let mut cfg = st.cfg.lock().unwrap();
+        let mut next = cfg.clone();
+        next.provider_order = config::remember_order(order, &cfg.provider_order);
+        config::save_checked(&next)?;
+        *cfg = next;
+        cfg.provider_order.clone()
+    };
+    let _ = app.emit("provider_order", &order);
+    Ok(order)
+}
+
+#[tauri::command]
+fn get_provider_nicknames(app: AppHandle) -> std::collections::BTreeMap<String, String> {
+    let st = app.state::<AppState>();
+    let names = st.cfg.lock().unwrap().provider_nicknames.clone();
+    names
+}
+
+#[tauri::command]
+fn set_provider_nickname(app: AppHandle, provider: String, name: String)
+    -> Result<std::collections::BTreeMap<String, String>, String>
+{
+    if !TRAY_PROVIDER_IDS.contains(&provider.as_str()) {
+        return Err("Unknown provider identity".into());
+    }
+    let name = config::nickname_or_none(&name)?;
+    let names = {
+        let st = app.state::<AppState>();
+        let mut cfg = st.cfg.lock().unwrap();
+        let mut next = cfg.clone();
+        if let Some(name) = name {
+            next.provider_nicknames.insert(provider, name);
+        } else {
+            next.provider_nicknames.remove(&provider);
+        }
+        config::save_checked(&next)?;
+        *cfg = next;
+        cfg.provider_nicknames.clone()
+    };
+    let _ = app.emit("provider_nicknames", &names);
+    tray::refresh_menu(&app);
+    Ok(names)
 }
 
 /// The application's own icon, so the settings window shows what the taskbar shows.
@@ -1606,6 +1683,73 @@ fn open_settings(app: AppHandle) {
     settings_window::open(&app);
 }
 
+static TELEMETRY_REFRESH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn telemetry_service(app: &AppHandle) -> Result<Arc<Mutex<telemetry::TelemetryService>>, String> {
+    app.state::<AppState>().telemetry.clone().ok_or_else(|| "Telemetry initialization failed; check the app log".into())
+}
+
+#[tauri::command]
+async fn get_telemetry_settings(app: AppHandle) -> Result<telemetry::TelemetrySettings, String> {
+    let service = telemetry_service(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        service.lock().map(|s| s.settings()).map_err(|_| "Telemetry lock unavailable".to_string())
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn set_telemetry_settings(app: AppHandle, settings: telemetry::TelemetrySettings) -> Result<telemetry::TelemetrySettings, String> {
+    let service = telemetry_service(&app)?;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        service.lock().map_err(|_| "Telemetry lock unavailable".to_string())?.configure(settings)
+    }).await.map_err(|e| e.to_string())??;
+    TELEMETRY_REFRESH.store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(result)
+}
+
+#[tauri::command]
+async fn get_telemetry_report(app: AppHandle, query: telemetry::TelemetryQuery) -> Result<telemetry::TelemetryReport, String> {
+    let service = telemetry_service(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        service.lock().map(|s| s.report(query)).map_err(|_| "Telemetry lock unavailable".to_string())
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn choose_telemetry_directory(app: AppHandle) -> Result<Option<String>, String> {
+    let settings = get_telemetry_settings(app.clone()).await?;
+    #[cfg(windows)]
+    let owner = app.get_webview_window("telemetry").and_then(|w| w.hwnd().ok()).map(|h| h.0 as isize).unwrap_or(0);
+    #[cfg(not(windows))]
+    let owner = 0;
+    tauri::async_runtime::spawn_blocking(move || telemetry_picker::choose(settings.export_directory.or(settings.suggested_directory), owner))
+        .await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn open_telemetry(app: AppHandle) { telemetry_window::open(&app); }
+
+fn start_telemetry(app: AppHandle) {
+    let Ok(service) = telemetry_service(&app) else { return; };
+    if service.lock().map(|s| s.settings().export_directory.is_none()).unwrap_or(false) {
+        telemetry_window::open(&app);
+    }
+    std::thread::spawn(move || {
+        activity::lower_thread_priority();
+        loop {
+            let result = service.lock().map_err(|_| "Telemetry lock unavailable".to_string()).and_then(|mut s| s.scan());
+            match result {
+                Ok(()) => { let _ = app.emit("telemetry_updated", ()); }
+                Err(error) => { let _ = app.emit("telemetry_error", &error); }
+            }
+            for _ in 0..30 {
+                if TELEMETRY_REFRESH.swap(false, std::sync::atomic::Ordering::Relaxed) { break; }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
+    });
+}
+
 /// Epoch milliseconds. Every polling module keeps its own copy of this; the tray menu's wording
 /// needs one that is not private to a poller.
 pub fn now_ms() -> u64 {
@@ -1624,12 +1768,29 @@ pub fn provider_label(id: &str) -> &'static str {
         "gemini" => "Antigravity",
         "glm" => "z.ai",
         "opencode" => "OpenCode",
+        "kiro" => "Kiro",
         _ => "Claude",
     }
 }
 
-/// Every provider the tray menu can offer, in the order the notch shows them.
-pub const TRAY_PROVIDER_IDS: [&str; 8] = ["claude", "codex", "glm", "opencode", "cursor", "grok", "copilot", "gemini"];
+pub(crate) fn provider_display_name(app: &AppHandle, id: &str) -> String {
+    let st = app.state::<AppState>();
+    let cfg = st.cfg.lock().unwrap();
+    cfg.provider_nicknames.get(id)
+        .and_then(|name| config::nickname_or_none(name).ok().flatten())
+        .unwrap_or_else(|| provider_label(id).to_string())
+}
+
+/// Every provider the tray menu can offer, in built-in order.
+pub const TRAY_PROVIDER_IDS: [&str; 9] = ["claude", "codex", "glm", "opencode", "cursor", "grok", "copilot", "gemini", "kiro"];
+
+pub(crate) fn provider_ids_in_order(app: &AppHandle) -> Vec<&'static str> {
+    let st = app.state::<AppState>();
+    let cfg = st.cfg.lock().unwrap();
+    let mut ids = TRAY_PROVIDER_IDS.to_vec();
+    ids.sort_by_key(|id| cfg.provider_order.iter().position(|saved| saved.as_str() == *id).unwrap_or(usize::MAX));
+    ids
+}
 
 /// Keeps the tray menu current. macOS rebuilds its menu as it opens; Tauri has no such hook, so it
 /// is rebuilt whenever a reading changes, and once a minute besides — otherwise "Resets in 12 min"
@@ -1821,8 +1982,13 @@ fn main() {
             antigravity: Mutex::new(antigravity::load_persisted()),
             glm: Mutex::new(glm::load_persisted()),
             opencode: Mutex::new(opencode::load_persisted()),
+            kiro: Mutex::new(kiro::load_persisted()),
             glyphs: Mutex::new(Default::default()),
             activity: Mutex::new(Vec::new()),
+            telemetry: match telemetry::TelemetryService::new() {
+                Ok(service) => Some(Arc::new(Mutex::new(service))),
+                Err(error) => { applog(&format!("telemetry initialization: {error}")); None }
+            },
         })
         .invoke_handler(tauri::generate_handler![
             get_state,
@@ -1846,6 +2012,7 @@ fn main() {
             get_antigravity,
             get_glm,
             get_opencode,
+            get_kiro,
             get_glyphs,
             get_activity,
             open_data_dir,
@@ -1882,6 +2049,10 @@ fn main() {
             get_tray_options,
             get_notch_slots,
             set_notch_slots,
+            get_provider_order,
+            set_provider_order,
+            get_provider_nicknames,
+            set_provider_nickname,
             get_antigravity_prefs,
             set_antigravity_prefs,
             get_app_icon,
@@ -1900,6 +2071,15 @@ fn main() {
             get_monitors,
             set_notch_monitor,
             open_settings,
+            open_telemetry,
+            get_telemetry_settings,
+            set_telemetry_settings,
+            get_telemetry_report,
+            choose_telemetry_directory,
+            telemetry_window::telemetry_ready,
+            work_calendar::get_calendar_settings,
+            work_calendar::set_calendar_settings,
+            work_calendar::detect_calendar_location,
             get_adaptive_pill,
             set_adaptive_pill,
             settings_window::get_system_look,
@@ -1932,8 +2112,10 @@ fn main() {
             antigravity::start(handle.clone());
             glm::start(handle.clone());
             opencode::start(handle.clone());
+            kiro::start(handle.clone());
             activity::start(handle.clone());
             reset_watch::start(handle.clone());
+            start_telemetry(handle.clone());
             // Collecting glyphs may read icon resources out of a few executables; do it off the main thread and push when done
             let gh = handle.clone();
             std::thread::spawn(move || reload_glyphs(&gh));
@@ -2281,6 +2463,13 @@ mod tests {
         assert_eq!(pick("codex", &[win("spark", 0.1), win("secondary", 0.4)]), None);
         assert_eq!(pick("codex", &[win("secondary", 0.4)]), None);
         assert_eq!(pick("codex", &[win("spark", 0.1), win("code-review", 0.2)]), None);
+    }
+
+    #[test]
+    fn kiro_headline_never_uses_bonus_or_overage() {
+        assert_eq!(pick("kiro", &[win("bonus", 0.9), win("credits", 0.3), win("overage", 1.0)]), Some("credits"));
+        assert_eq!(pick("kiro", &[win("bonus", 0.9), win("overage", 1.0)]), None);
+        assert_eq!(pick("kiro", &[]), None);
     }
 
     #[test]

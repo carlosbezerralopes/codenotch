@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Codenotch Telemetry</title>
+<style>
+:root{color-scheme:dark;--bg:#2b2b2e;--group:#38383c;--text:#f2f2f4;--muted:#b1b1b9;--line:#55555b;--accent:#0a7aff;--danger:#ffb0a8}
+:root[data-theme="light"]{color-scheme:light;--bg:#f0f0f2;--group:#fff;--text:#1d1d1f;--muted:#66666e;--line:#d5d5db;--danger:#ad271b}
+*{box-sizing:border-box}body{margin:0;padding:22px;background:var(--bg);color:var(--text);font:13.5px/1.4 "Segoe UI Variable Text","Segoe UI",system-ui,sans-serif}
+h1{font-size:22px;margin:0 0 8px;font-weight:600}h2,summary{font-size:14px;font-weight:600}h2{margin:0 0 12px}summary{cursor:pointer}
+p{margin:8px 0}.muted{color:var(--muted)}.group{background:var(--group);border:1px solid var(--line);border-radius:10px;padding:14px;margin-top:14px}
+label{display:flex;flex-direction:column;gap:4px;min-width:0}input,select,button{font:inherit;color:var(--text);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px 9px}
+button{cursor:pointer}button:hover{border-color:var(--accent)}button:disabled{opacity:.5;cursor:default}.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}input[type=checkbox]{accent-color:var(--accent)}.inline{flex-direction:row;align-items:center}.controls{display:flex;gap:8px;align-items:end;flex-wrap:wrap}.grow{flex:1;min-width:240px}
+.filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}.mapping{display:flex;gap:8px;margin-top:8px}.mapping input{flex:1;min-width:0}.notice{color:var(--danger);white-space:pre-wrap;overflow-wrap:anywhere}#status{min-height:20px}#totals{display:flex;flex-wrap:wrap;gap:8px 20px;padding:10px 0}
+.scroll{overflow:auto}table{border-collapse:collapse;width:100%;font-size:12px}th,td{text-align:left;border-bottom:1px solid var(--line);padding:8px;vertical-align:top}th{white-space:nowrap}th button{border:0;background:transparent;padding:0;text-align:left}td.numeric{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}.path{min-width:160px;max-width:280px;overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.4 "Consolas",monospace}details.event{border-bottom:1px solid var(--line);padding:8px 0}details.event summary{font-size:12px;font-weight:400}dl{display:grid;grid-template-columns:140px 1fr;gap:4px 10px}dt{color:var(--muted)}dd{margin:0;overflow-wrap:anywhere}[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<h1 data-copy="Telemetry">Telemetry</h1>
+<p class="muted" data-copy="Recorded usage by tool, project and folder. Tokens and credits are separate units.">Recorded usage by tool, project and folder. Tokens and credits are separate units.</p>
+<div id="status" role="status" aria-live="polite"></div>
+<details id="setup" class="group" open>
+<summary data-copy="Configuration">Configuration</summary>
+<p id="first-use" class="muted" data-copy="Choose where to save the shared history. Collection starts only after you save.">Choose where to save the shared history. Collection starts only after you save.</p>
+<div class="controls"><label class="grow"><span data-copy="History directory">History directory</span><input id="directory" autocomplete="off"></label><button id="browse" data-copy="Browse…">Browse…</button></div>
+<div class="controls" style="margin-top:10px"><label class="inline"><input id="enabled" type="checkbox"><span data-copy="Collect usage">Collect usage</span></label><label><span data-copy="Collection machine">Collection machine</span><input id="machine" maxlength="80"></label><label><span data-copy="Default report days">Default report days</span><input id="history-days" type="number" min="1" max="3650" value="90"></label><label><span data-copy="UTC offset (minutes)">UTC offset (minutes)</span><input id="utc-offset" type="number" min="-840" max="840" value="-180"></label></div>
+<p class="muted" data-copy="Read usage is retained. This period only sets the initial report range; collection machines do not prove where a copied session originally ran.">Read usage is retained. This period only sets the initial report range; collection machines do not prove where a copied session originally ran.</p>
+<p class="muted" data-copy="Optional folder prefixes assign projects; the most specific prefix wins.">Optional folder prefixes assign projects; the most specific prefix wins.</p>
+<div id="mappings"></div><div class="controls" style="margin-top:10px"><button id="add-mapping" data-copy="Add project mapping">Add project mapping</button><button id="save" class="primary" data-copy="Save configuration">Save configuration</button><button id="retry" data-copy="Reload configuration">Reload configuration</button></div>
+</details>
+<section id="history" class="group" hidden>
+<h2 data-copy="History">History</h2>
+<form id="filters" class="filters">
+<label><span data-copy="From date">From date</span><input id="from-date" type="date"></label><label><span data-copy="To date">To date</span><input id="to-date" type="date"></label>
+<label><span data-copy="Group by">Group by</span><select id="grain"><option value="event" data-copy="Event">Event</option><option value="hour" data-copy="Hour">Hour</option><option value="day" selected data-copy="Day">Day</option><option value="week" data-copy="Week">Week</option><option value="month" data-copy="Month">Month</option></select></label>
+<label><span data-copy="Tool">Tool</span><select id="provider"><option value="" data-copy="All tools">All tools</option><option value="claude">Claude</option><option value="codex">Codex</option><option value="kiro">Kiro</option></select></label>
+<label><span data-copy="Machine">Machine</span><input id="filter-machine" placeholder="All" data-placeholder="All"></label><label><span data-copy="Project">Project</span><input id="project" placeholder="All" data-placeholder="All"><span class="inline"><input id="unknown-project" type="checkbox"><span data-copy="Unknown only">Unknown only</span></span></label>
+<label><span data-copy="Folder">Folder</span><input id="folder" placeholder="All" data-placeholder="All"><span class="inline"><input id="unknown-folder" type="checkbox"><span data-copy="Unknown only">Unknown only</span></span></label><button type="submit" id="refresh" data-copy="Refresh">Refresh</button>
+</form>
+<p class="muted" data-copy="Filters match exact names. Empty fields include every machine and project.">Filters match exact names. Empty fields include every machine and project.</p>
+<div id="totals"></div><p id="scan" class="muted"></p><div id="coverage"></div><div id="issues" class="notice"></div><p id="truncated" class="notice" hidden data-copy="This report was limited. Narrow the dates or filters to inspect more detail.">This report was limited. Narrow the dates or filters to inspect more detail.</p>
+<div class="scroll"><table><thead id="columns"></thead><tbody id="rows"></tbody></table></div>
+<h2 style="margin-top:18px" data-copy="Recent events (up to 200)">Recent events (up to 200)</h2><div id="events"></div>
+</section>
+<script>
+const invoke=(command,args)=>window.__TAURI__.core.invoke(command,args);
+const $=id=>document.getElementById(id);
+let language='en', settings=null, report=null, sortKey='period', sortDirection=-1, busy=false;
+const PT={Telemetry:'Telemetria',Configuration:'Configuração',History:'Histórico','History directory':'Pasta do histórico','Browse…':'Procurar…','Collect usage':'Coletar uso',Machine:'Máquina','History days':'Dias de histórico','UTC offset (minutes)':'Diferença UTC (minutos)','Add project mapping':'Adicionar projeto','Save configuration':'Salvar configuração','Reload configuration':'Recarregar configuração','From date':'Data inicial','To date':'Data final','Group by':'Agrupar por',Event:'Evento',Hour:'Hora',Day:'Dia',Week:'Semana',Month:'Mês',Tool:'Ferramenta','All tools':'Todas as ferramentas',Project:'Projeto',Folder:'Pasta',All:'Todos','Unknown only':'Somente desconhecidos',Refresh:'Atualizar',Period:'Período',Input:'Entrada','Cached input':'Entrada em cache','Cache creation':'Criação de cache',Output:'Saída',Reasoning:'Raciocínio','Total tokens':'Total tokens',Credits:'Créditos',Events:'Eventos',Remove:'Remover','Folder prefix':'Prefixo da pasta','Project name':'Nome do projeto',Source:'Fonte',Quality:'Qualidade',Model:'Modelo','Requested model':'Modelo solicitado',Status:'Estado',Provenance:'Proveniência','Last scan':'Última coleta','No records for these filters.':'Nenhum registro para estes filtros.','Saving…':'Salvando…','Loading…':'Carregando…','Configuration saved.':'Configuração salva.','Collection paused.':'Coleta pausada.','Select a directory before saving.':'Escolha uma pasta antes de salvar.','Invalid date range.':'Intervalo de datas inválido.','Invalid history days or UTC offset.':'Dias de histórico ou diferença UTC inválidos.','Fill both fields in every project mapping.':'Preencha os dois campos de cada projeto.','Choose where to save the shared history. Collection starts only after you save.':'Escolha onde salvar o histórico compartilhado. A coleta começa somente após salvar.','Optional folder prefixes assign projects; the most specific prefix wins.':'Prefixos de pasta podem definir projetos; o prefixo mais específico prevalece.','Recorded usage by tool, project and folder. Tokens and credits are separate units.':'Uso registrado por ferramenta, projeto e pasta. Tokens e créditos são unidades separadas.','Filters match exact names. Empty fields include every machine and project.':'Os filtros correspondem a nomes exatos. Campos vazios incluem todas as máquinas e projetos.','This report was limited. Narrow the dates or filters to inspect more detail.':'O relatório foi limitado. Restrinja datas ou filtros para consultar mais detalhes.','Recent events (up to 200)':'Eventos recentes (até 200)'};
+Object.assign(PT,{
+  'Collection machine':'Máquina de coleta','Collection machines':'Máquinas de coleta',
+  'Default report days':'Período inicial do relatório (dias)',
+  'Attribution source':'Origem da atribuição','Gaps':'Lacunas',
+  'Choose a valid machine name.':'Escolha um nome de máquina válido.',
+  'Read usage is retained. This period only sets the initial report range; collection machines do not prove where a copied session originally ran.':'O uso já lido é preservado. Este período define apenas o intervalo inicial do relatório; a máquina de coleta não comprova onde uma sessão copiada foi executada originalmente.'
+});
+function tr(s){return language==='pt-BR'?(PT[s]||s):s;}
+// BEGIN TESTABLE TELEMETRY
+function escapeHtml(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function amount(value,credits=false){
+  if(typeof value!=='number'||!Number.isFinite(value)||value<0) return '—';
+  return new Intl.NumberFormat(language==='pt-BR'?'pt-BR':'en-US',{maximumFractionDigits:credits?6:0}).format(value);
+}
+function known(value){return value==null||value===''?'—':escapeHtml(value);}
+function tokenValue(row,key){return row.tokens&&typeof row.tokens[key]==='number'?row.tokens[key]:null;}
+function queryFrom(values){
+  const date=s=>{if(!s)return null;const parsed=new Date(s+'T00:00:00Z');if(!/^\d{4}-\d{2}-\d{2}$/.test(s)||!Number.isFinite(parsed.getTime())||parsed.toISOString().slice(0,10)!==s)throw Error(tr('Invalid date range.'));return s;};
+  const from=date(values.from_date), to=date(values.to_date);
+  if(from&&to&&from>to) throw Error(tr('Invalid date range.'));
+  if(!['event','hour','day','week','month'].includes(values.grain)) throw Error(tr('Invalid date range.'));
+  return {from_date:from,to_date:to,grain:values.grain,provider:values.provider||null,machine:values.machine||null,project:values.unknown_project?'':values.project||null,folder:values.unknown_folder?'':values.folder||null};
+}
+function settingsFrom(previous,values){
+  if(!values.directory.trim()) throw Error(tr('Select a directory before saving.'));
+  const days=Number(values.history_days), offset=Number(values.utc_offset_minutes);
+  if(!Number.isInteger(days)||days<1||days>3650||!Number.isInteger(offset)||Math.abs(offset)>840) throw Error(tr('Invalid history days or UTC offset.'));
+  const mappings=values.project_mappings.map(m=>({prefix:m.prefix.trim(),project:m.project.trim()}));
+  if(mappings.some(m=>!m.prefix||!m.project)) throw Error(tr('Fill both fields in every project mapping.'));
+  const machine=values.machine==null?previous.machine:values.machine.trim();
+  if(!machine||machine.length>80||/[\x00-\x1f\x7f]/.test(machine))throw Error(tr('Choose a valid machine name.'));
+  return {...previous,machine,export_directory:values.directory.trim(),enabled:!!values.enabled,history_days:days,utc_offset_minutes:offset,project_mappings:mappings};
+}
+function sortedRows(rows,key,direction){
+  const value=r=>['input','cached_input','cache_creation','output','reasoning_output','total'].includes(key)?tokenValue(r,key):r[key];
+  return rows.slice().sort((a,b)=>{const x=value(a),y=value(b);if(x==null)return y==null?0:1;if(y==null)return -1;return direction*(typeof x==='number'&&typeof y==='number'?x-y:String(x).localeCompare(String(y)));});
+}
+function rowHtml(r){
+  return `<tr><td>${known(r.period)}</td><td>${known(r.provider)}</td><td>${known(r.machine)}</td><td>${known(r.project)}</td><td class="path">${known(r.folder)}</td>${['input','cached_input','cache_creation','output','reasoning_output','total'].map(k=>`<td class="numeric">${amount(tokenValue(r,k))}</td>`).join('')}<td class="numeric">${amount(r.credits,true)}</td><td class="numeric">${amount(r.event_count)}</td></tr>`;
+}
+function eventTime(value,offset){
+  if(!value) return '—';
+  const stamp=Date.parse(value);
+  if(!Number.isFinite(stamp)) return known(value);
+  return escapeHtml(new Intl.DateTimeFormat(language==='pt-BR'?'pt-BR':'en-US',{dateStyle:'short',timeStyle:'medium',timeZone:'UTC'}).format(new Date(stamp+offset*60000)));
+}
+function eventHtml(e,offset){
+  const machines=Array.isArray(e.observed_machines)&&e.observed_machines.length?e.observed_machines.join(', '):e.machine;
+  const fields=[['Collection machines',machines],['Project',e.project],['Folder',e.folder],['Attribution source',e.attribution_source],['Source',e.source],['Quality',e.quality],['Model',e.model],['Requested model',e.requested_model],['Status',e.status],['Gaps',Array.isArray(e.gaps)?e.gaps.join('; '):null]];
+  const tokens=['input','cached_input','cache_creation','output','reasoning_output','total'].map((k,i)=>`<dt>${tr(['Input','Cached input','Cache creation','Output','Reasoning','Total tokens'][i])}</dt><dd>${amount(tokenValue(e,k))}</dd>`).join('');
+  return `<details class="event"><summary>${eventTime(e.occurred_at,offset)} · ${known(e.provider)} · ${known(e.project)} · ${known(e.machine)} · ${amount(e.credits,true)} ${tr('Credits')} · ${amount(tokenValue(e,'total'))} ${tr('Total tokens')}</summary><dl>${fields.map(([k,v])=>`<dt>${tr(k)}</dt><dd>${known(v)}</dd>`).join('')}${tokens}<dt>${tr('Credits')}</dt><dd>${amount(e.credits,true)}</dd><dt>${tr('Provenance')}</dt><dd><pre>${escapeHtml(JSON.stringify(e.provenance??null,null,2))}</pre></dd></dl>${Array.isArray(e.folders)&&e.folders.length?`<p class="muted">${e.folders.map(escapeHtml).join('<br>')}</p>`:''}</details>`;
+}
+async function browseDirectory(api,current){const chosen=await api('choose_telemetry_directory');return typeof chosen==='string'&&chosen.trim()?chosen:current;}
+async function persistSettings(api,previous,values){const next=settingsFrom(previous,values);return await api('set_telemetry_settings',{settings:next});}
+// END TESTABLE TELEMETRY
+function status(message,error=false){$('status').textContent=message;$('status').className=error?'notice':'muted';}
+function localize(){
+  document.documentElement.lang=language;
+  for(const node of document.querySelectorAll('[data-copy]'))node.textContent=tr(node.dataset.copy);
+  for(const node of document.querySelectorAll('[data-placeholder]'))node.placeholder=tr(node.dataset.placeholder);
+}
+function addMapping(prefix='',project=''){
+  const row=document.createElement('div');row.className='mapping';
+  row.innerHTML=`<input aria-label="${tr('Folder prefix')}" placeholder="${tr('Folder prefix')}" value="${escapeHtml(prefix)}"><input aria-label="${tr('Project name')}" placeholder="${tr('Project name')}" value="${escapeHtml(project)}"><button type="button">${tr('Remove')}</button>`;
+  row.querySelector('button').onclick=()=>row.remove();$('mappings').appendChild(row);
+}
+function renderSettings(){
+  $('directory').value=settings.export_directory||settings.suggested_directory||'';
+  $('machine').value=settings.machine||'';$('enabled').checked=settings.export_directory?settings.enabled:true;
+  $('history-days').value=settings.history_days;$('utc-offset').value=settings.utc_offset_minutes;
+  $('mappings').innerHTML='';for(const m of settings.project_mappings||[])addMapping(m.prefix,m.project);
+  const configured=!!settings.export_directory;$('first-use').hidden=configured;$('setup').open=!configured;$('history').hidden=!configured;
+}
+function clearReport(){report=null;for(const id of ['rows','totals','scan','coverage','issues','events'])$(id).textContent='';$('truncated').hidden=true;}
+function readSettings(){return {directory:$('directory').value,machine:$('machine').value,enabled:$('enabled').checked,history_days:$('history-days').value,utc_offset_minutes:$('utc-offset').value,project_mappings:Array.from($('mappings').children,r=>{const inputs=r.querySelectorAll('input');return {prefix:inputs[0].value,project:inputs[1].value};})};}
+function readQuery(){return queryFrom({from_date:$('from-date').value,to_date:$('to-date').value,grain:$('grain').value,provider:$('provider').value,machine:$('filter-machine').value,project:$('project').value,folder:$('folder').value,unknown_project:$('unknown-project').checked,unknown_folder:$('unknown-folder').checked});}
+const columns=[['period','Period'],['provider','Tool'],['machine','Machine'],['project','Project'],['folder','Folder'],['input','Input'],['cached_input','Cached input'],['cache_creation','Cache creation'],['output','Output'],['reasoning_output','Reasoning'],['total','Total tokens'],['credits','Credits'],['event_count','Events']];
+function renderReport(){
+  if(!report)return;
+  $('history').hidden=!report.configured;
+  $('columns').innerHTML='<tr>'+columns.map(([key,label])=>`<th><button type="button" data-sort="${key}">${tr(label)}${sortKey===key?(sortDirection===1?' ↑':' ↓'):''}</button></th>`).join('')+'</tr>';
+  for(const b of $('columns').querySelectorAll('button'))b.onclick=()=>{sortDirection=sortKey===b.dataset.sort?-sortDirection:1;sortKey=b.dataset.sort;renderReport();};
+  const rows=report.rows||[];$('rows').innerHTML=rows.length?sortedRows(rows,sortKey,sortDirection).map(rowHtml).join(''):`<tr><td colspan="13">${tr('No records for these filters.')}</td></tr>`;
+  const totals=report.totals||{};$('totals').innerHTML=[['Total tokens',amount(tokenValue(totals,'total'))],['Credits',amount(totals.credits,true)],['Events',amount(totals.event_count)]].map(([label,value])=>`<span>${tr(label)}: <strong>${value}</strong></span>`).join('');
+  $('scan').innerHTML=`${tr('Last scan')}: ${eventTime(report.last_scan_at,settings.utc_offset_minutes)}${report.enabled?'':` · ${tr('Collection paused.')}`}`;
+  $('coverage').innerHTML=(report.coverage||[]).map(c=>`<p class="muted">${known(c.provider)} · ${known(c.source)} · ${known(c.status)}: ${known(c.message)}</p>`).join('');
+  $('issues').textContent=(report.issues||[]).join('\n');$('truncated').hidden=!report.truncated;
+  $('events').innerHTML=(report.recent_events||[]).slice(0,200).map(e=>eventHtml(e,settings.utc_offset_minutes)).join('')||`<p class="muted">${tr('No records for these filters.')}</p>`;
+}
+function setBusy(value){busy=value;for(const id of ['save','browse','refresh'])$(id).disabled=value||!settings;$('retry').disabled=value;}
+async function refreshReport(){
+  if(!settings||!settings.export_directory||busy)return;
+  setBusy(true);status(tr('Loading…'));
+  try{report=await invoke('get_telemetry_report',{query:readQuery()});renderReport();status('');}catch(e){status(String(e),true);}finally{setBusy(false);}
+}
+async function loadSettings(){
+  if(busy)return;setBusy(true);status(tr('Loading…'));
+  try{settings=await invoke('get_telemetry_settings');renderSettings();status('');}catch(e){status(String(e),true);}finally{setBusy(false);}
+  await refreshReport();
+}
+async function saveSettings(){
+  if(busy||!settings)return;setBusy(true);status(tr('Saving…'));
+  let saved=false;
+  try{settings=await persistSettings(invoke,settings,readSettings());clearReport();renderSettings();saved=true;status(tr('Configuration saved.'));}catch(e){status(String(e),true);}finally{setBusy(false);}
+  if(saved)await refreshReport();
+}
+$('browse').onclick=async()=>{if(busy)return;setBusy(true);try{$('directory').value=await browseDirectory(invoke,$('directory').value);status('');}catch(e){status(String(e),true);}finally{setBusy(false);}};
+$('save').onclick=saveSettings;$('retry').onclick=loadSettings;$('add-mapping').onclick=()=>addMapping();$('filters').onsubmit=e=>{e.preventDefault();refreshReport();};
+function applyTheme(theme){document.documentElement.dataset.theme=theme;}
+async function initialize(){
+  setBusy(true);
+  try{const [lang,theme]=await Promise.all([invoke('get_lang_resolved'),invoke('get_theme_resolved')]);language=lang==='pt-BR'?'pt-BR':'en';applyTheme(theme);}catch(e){status(String(e),true);}finally{setBusy(false);}
+  localize();await loadSettings();await invoke('telemetry_ready').catch(e=>status(String(e),true));
+  window.__TAURI__.event.listen('theme_resolved',e=>applyTheme(e.payload));
+}
+initialize();
+setInterval(()=>{if(settings&&settings.enabled&&settings.export_directory&&!document.hidden)refreshReport();},30000);
+</script>
+</body>
+</html>

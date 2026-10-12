@@ -91,9 +91,15 @@ pub struct Config {
     /// kept so an existing config migrates cleanly.
     #[serde(default)]
     pub notch_providers: Vec<String>,
-    /// Which providers get a ring on the notch, in order. An empty list means every provider.
+    /// Which providers get a ring on the notch. Empty means every provider; order is separate.
     #[serde(default)]
     pub notch_slots: Vec<TraySlot>,
+    /// Presentation order, independent of visibility. Empty keeps the built-in order.
+    #[serde(default)]
+    pub provider_order: Vec<String>,
+    /// User names keyed by provider identity; never changes which account or quota is read.
+    #[serde(default)]
+    pub provider_nicknames: BTreeMap<String, String>,
     /// Antigravity's lane on the ring, as the Mac app's "Notch reads": "automatic", "5h" or "weekly"
     #[serde(default = "default_antigravity_limit")]
     pub antigravity_limit: String,
@@ -110,6 +116,9 @@ pub struct Config {
     /// The same one-shot migration for the GitHub Copilot ring.
     #[serde(default)]
     pub copilot_notch_fixed: bool,
+    /// Add Kiro once to selections saved before this adapter existed.
+    #[serde(default)]
+    pub kiro_notch_fixed: bool,
     /// false = the pill is kept off the screen edge entirely; the tray icon is then the only way in
     #[serde(default = "yes")]
     pub notch_visible: bool,
@@ -298,11 +307,14 @@ impl Default for Config {
             theme: default_theme(),
             notch_providers: Vec::new(), // empty = show them all
             notch_slots: Vec::new(),     // filled in by load(), from notch_providers
+            provider_order: Vec::new(),
+            provider_nicknames: BTreeMap::new(),
             antigravity_limit: default_antigravity_limit(),
             antigravity_model: default_antigravity_model(),
             glm_notch_fixed: true, // a fresh install picks from the full list already
             opencode_notch_fixed: true,
             copilot_notch_fixed: true,
+            kiro_notch_fixed: true,
             notch_visible: true,
             notch_on_hover: true,
             tray_visible: true,
@@ -338,6 +350,7 @@ pub fn load() -> Config {
             .map(|p| TraySlot { provider: p.clone() })
             .collect();
     }
+    migrate_provider_order(&mut cfg, raw.as_deref());
 
     carry_shared_position(&mut cfg);
     // A selection saved before GLM existed gets the GLM ring back exactly once.
@@ -346,6 +359,7 @@ pub fn load() -> Config {
     migrate_opencode_notch(&mut cfg, &raw);
     // And for GitHub Copilot.
     migrate_copilot_notch(&mut cfg, &raw);
+    migrate_kiro_notch(&mut cfg, &raw);
 
     // Both hidden would leave the app unreachable: no pill, no tray icon, no way to open settings.
     if !cfg.notch_visible && !cfg.tray_visible {
@@ -362,6 +376,39 @@ pub fn load() -> Config {
     cfg.critical_limit = cfg.critical_limit.clamp(0.02, 1.0);
     cfg.watch_limit = clamp_watch_limit(cfg.watch_limit, cfg.critical_limit);
     cfg
+}
+
+fn migrate_provider_order(cfg: &mut Config, raw: Option<&str>) {
+    let predates = raw
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+        .is_some_and(|value| value.get("provider_order").is_none());
+    if predates {
+        cfg.provider_order = remember_order(
+            cfg.notch_slots.iter().map(|slot| slot.provider.clone()).collect(), &[],
+        );
+    }
+}
+
+/// Deduplicate the current list and keep remembered identities that are not present today.
+pub fn remember_order(visible: Vec<String>, remembered: &[String]) -> Vec<String> {
+    let mut order = Vec::new();
+    for id in visible.into_iter().chain(remembered.iter().cloned()) {
+        if !order.contains(&id) {
+            order.push(id);
+        }
+    }
+    order
+}
+
+pub fn nickname_or_none(name: &str) -> Result<Option<String>, String> {
+    if name.chars().any(char::is_control) {
+        return Err("Names cannot contain control characters".into());
+    }
+    let name = name.trim();
+    if name.chars().count() > 60 {
+        return Err("Names can contain at most 60 characters".into());
+    }
+    Ok((!name.is_empty()).then(|| name.to_string()))
 }
 
 fn migrate_glm_notch(cfg: &mut Config, raw: &Option<String>) {
@@ -409,18 +456,84 @@ fn migrate_copilot_notch(cfg: &mut Config, raw: &Option<String>) {
     cfg.copilot_notch_fixed = true;
 }
 
+fn migrate_kiro_notch(cfg: &mut Config, raw: &Option<String>) {
+    let predates = raw.as_deref().and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+        .map(|v| v.get("kiro_notch_fixed").is_none()).unwrap_or(false);
+    if !predates { return; }
+    if !cfg.notch_slots.is_empty() && !cfg.notch_slots.iter().any(|s| s.provider == "kiro") {
+        cfg.notch_slots.push(TraySlot { provider: "kiro".into() });
+    }
+    cfg.kiro_notch_fixed = true;
+}
+
 pub fn save(cfg: &Config) {
+    let _ = save_checked(cfg);
+}
+
+pub fn save_checked(cfg: &Config) -> Result<(), String> {
     let path = config_path();
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
     }
-    if let Ok(txt) = serde_json::to_string_pretty(cfg) {
-        let _ = std::fs::write(path, txt);
-    }
+    let text = serde_json::to_string_pretty(cfg).map_err(|error| error.to_string())?;
+    std::fs::write(path, text).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn presentation_migration_retains_absent_ids_and_explicit_order() {
+        let mut old: super::Config = serde_json::from_str(
+            r#"{"notch_slots":[{"provider":"codex"},{"provider":"removed"},{"provider":"claude"}]}"#,
+        ).unwrap();
+        super::migrate_provider_order(&mut old, Some(r#"{"notch_slots":[]}"#));
+        assert_eq!(old.provider_order, ["codex", "removed", "claude"]);
+        old.provider_order = vec!["kiro".into(), "codex".into()];
+        super::migrate_provider_order(&mut old, Some(r#"{"provider_order":[]}"#));
+        assert_eq!(old.provider_order, ["kiro", "codex"]);
+        assert_eq!(super::remember_order(vec!["claude".into(), "claude".into()], &old.provider_order),
+            ["claude", "kiro", "codex"]);
+    }
+
+    #[test]
+    fn all_providers_visible_does_not_erase_presentation_on_reload() {
+        let mut cfg = super::Config::default();
+        cfg.provider_order = vec!["kiro".into(), "codex".into()];
+        cfg.provider_nicknames.insert("kiro".into(), "My account".into());
+        let saved = serde_json::to_string(&cfg).unwrap();
+        let restored: super::Config = serde_json::from_str(&saved).unwrap();
+        assert!(restored.notch_slots.is_empty());
+        assert_eq!(restored.provider_order, cfg.provider_order);
+        assert_eq!(restored.provider_nicknames, cfg.provider_nicknames);
+        let legacy: super::Config = serde_json::from_str("{}").unwrap();
+        assert!(legacy.provider_order.is_empty());
+        assert!(legacy.provider_nicknames.is_empty());
+    }
+
+    #[test]
+    fn names_are_bounded_trimmed_and_cannot_contain_controls() {
+        assert_eq!(super::nickname_or_none("  Work  ").unwrap(), Some("Work".into()));
+        assert_eq!(super::nickname_or_none("   ").unwrap(), None);
+        assert!(super::nickname_or_none(&"é".repeat(60)).is_ok());
+        assert!(super::nickname_or_none(&"é".repeat(61)).is_err());
+        for name in ["Work\nHome", "Work\0", "\tWork", "Work\u{0085}"] {
+            assert!(super::nickname_or_none(name).is_err());
+        }
+    }
+
+    #[test]
+    fn kiro_migration_is_once_and_preserves_explicit_order_and_hide() {
+        let mut cfg = super::Config::default();
+        cfg.notch_slots = vec![super::TraySlot { provider: "codex".into() }];
+        super::migrate_kiro_notch(&mut cfg, &Some("{}".into()));
+        assert_eq!(cfg.notch_slots.iter().map(|s| s.provider.as_str()).collect::<Vec<_>>(), ["codex", "kiro"]);
+        cfg.notch_slots.pop();
+        super::migrate_kiro_notch(&mut cfg, &Some("{\"kiro_notch_fixed\":true}".into()));
+        assert_eq!(cfg.notch_slots.len(), 1);
+        let mut fresh = super::Config::default();
+        super::migrate_kiro_notch(&mut fresh, &None);
+        assert!(fresh.notch_slots.is_empty());
+    }
     use super::{
         carry_shared_position, clamp_critical_limit, clamp_watch_limit, color_transition_or_step,
         keep_open_on_upgrade, snap_scale, theme_or_system, weekly_ring_or_off, Config,
