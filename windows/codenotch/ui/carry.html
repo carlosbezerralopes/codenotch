@@ -177,7 +177,14 @@ function notchPath(edge, a, b, depth, r, f, ja = 0, jb = 0){
 
 function dims(edge){
   const k = st.size, o = vertical(edge) ? st.shape.upright : st.shape.flat;
-  return { depth: o.depth * k, length: o.length * k, pitch: o.pitch * k, inset: o.inset * k };
+  return { depth: o.depth * k, length: o.length * k, pitch: o.pitch * k, inset: o.inset * k,
+    offsets: Array.isArray(o.offsets) ? o.offsets.map(value=>value*k) : null };
+}
+
+// Measured cells may have different sizes; old callers retain the uniform-pitch layout.
+function cellOffset(from,to,index,count,turned){
+  const offset=(shape)=>Number.isFinite(shape.offsets?.[index])?shape.offsets[index]:(index-(count-1)/2)*shape.pitch;
+  return offset(from)+(offset(to)-offset(from))*turned;
 }
 
 /* The notch with its middle at `p`: the corner it is going round, if any, and how long it is there —
@@ -303,9 +310,9 @@ function draw(hand){
   }
   const n = slots.length, k = st.size;
   const sign = st.edge === 'top' || st.edge === 'right' ? 1 : -1;
-  const pitch = from.pitch + (to.pitch - from.pitch) * turned, inset = from.inset + (to.inset - from.inset) * turned;
+  const inset = from.inset + (to.inset - from.inset) * turned;
   slots.forEach((s, i) => {
-    const [x, y] = ringPoint(wrap(p + sign * (i - (n - 1) / 2) * pitch + back), inset);
+    const [x, y] = ringPoint(wrap(p + sign * cellOffset(from,to,i,n,turned) + back), inset);
     s.el.style.transform = `translate(${(x - s.w * k / 2).toFixed(2)}px,${(y - s.h * k / 2).toFixed(2)}px) scale(${k})`;
   });
   drawHandle(p, length);
