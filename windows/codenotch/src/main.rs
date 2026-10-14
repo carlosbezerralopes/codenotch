@@ -40,6 +40,7 @@ mod usage_insights;
 mod quota_projection;
 mod topmost;
 mod updater;
+mod machine_monitor;
 
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
@@ -48,7 +49,7 @@ use tauri::{AppHandle, Emitter, Manager};
 /// and its tail on the left. `fitZoom` in ui/notch.html divides by the same width.
 pub const NOTCH_W: f64 = 360.0;
 /// Hand-bumped build tag, written to run.log at startup so a log can always be matched to the exe that wrote it.
-pub const BUILD: &str = "r36";
+pub const BUILD: &str = "r37";
 /// The notch window's long side: the upright window's height, and both sides of the flat one.
 ///
 /// Five cells make a 447 px pill; its fillets add 38.7 px at each end and the settings orb reaches
@@ -79,6 +80,7 @@ pub struct AppState {
     pub glyphs: Mutex<std::collections::HashMap<String, glyphs::Glyph>>,
     /// Working state of the non-Claude providers (Cursor reports it; Codex and Antigravity are inferred from recent writes)
     pub activity: Mutex<Vec<activity::Activity>>,
+    pub machine_monitor: Mutex<machine_monitor::Snapshot>,
     pub telemetry: Option<Arc<Mutex<telemetry::TelemetryService>>>,
 }
 
@@ -1341,6 +1343,38 @@ fn get_notch_slots(app: AppHandle) -> Vec<config::TraySlot> {
 }
 
 #[tauri::command]
+fn get_machine_snapshot(app: AppHandle) -> machine_monitor::Snapshot {
+    app.state::<AppState>().machine_monitor.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn get_machine_monitor_settings(app: AppHandle) -> machine_monitor::Settings {
+    app.state::<AppState>().cfg.lock().unwrap().machine_monitor.clone()
+}
+
+#[tauri::command]
+fn set_machine_monitor_settings(app: AppHandle, settings: machine_monitor::Settings)
+    -> Result<machine_monitor::Settings, String>
+{
+    let settings = settings.validate()?;
+    {
+        let st = app.state::<AppState>();
+        let mut cfg = st.cfg.lock().unwrap();
+        let mut next = cfg.clone();
+        next.machine_monitor = settings.clone();
+        config::save_checked(&next)?;
+        *cfg = next;
+    }
+    let _ = app.emit("machine_monitor_settings", &settings);
+    Ok(settings)
+}
+
+#[tauri::command]
+fn open_monitor_settings(app: AppHandle) {
+    settings_window::open_section(&app, "monitor", None, None);
+}
+
+#[tauri::command]
 fn set_notch_slots(app: AppHandle, slots: Vec<config::TraySlot>) -> Result<Vec<config::TraySlot>, String> {
     let list = {
         let st = app.state::<AppState>();
@@ -1951,7 +1985,7 @@ fn report(r: Result<String, String>) {
 }
 
 /// The subcommands that print to the parent console; only those may attach to it.
-const CONSOLE_CMDS: [&str; 4] = ["install-hooks", "uninstall-hooks", "autostart", "doctor"];
+const CONSOLE_CMDS: [&str; 5] = ["install-hooks", "uninstall-hooks", "autostart", "doctor", "machine-monitor"];
 
 /// ureq reads a proxy only from the environment. Started from Explorer or the Run key that
 /// variable is usually absent even where a system proxy is configured, and a machine that reaches
@@ -2008,6 +2042,13 @@ fn main() {
             attach_console();
         }
         match cmd.as_str() {
+            "machine-monitor" => {
+                match machine_monitor::smoke() {
+                    Ok(snapshot) => println!("{}", serde_json::to_string(&snapshot).unwrap()),
+                    Err(error) => { eprintln!("{error}"); std::process::exit(1); }
+                }
+                return;
+            }
             "install-hooks" => {
                 report(hooks_install::install());
                 return;
@@ -2062,6 +2103,7 @@ fn main() {
             kiro: Mutex::new(kiro::load_persisted()),
             glyphs: Mutex::new(Default::default()),
             activity: Mutex::new(Vec::new()),
+            machine_monitor: Mutex::new(Default::default()),
             telemetry: match telemetry::TelemetryService::new() {
                 Ok(service) => Some(Arc::new(Mutex::new(service))),
                 Err(error) => { applog(&format!("telemetry initialization: {error}")); None }
@@ -2092,6 +2134,10 @@ fn main() {
             get_kiro,
             get_glyphs,
             get_activity,
+            get_machine_snapshot,
+            get_machine_monitor_settings,
+            set_machine_monitor_settings,
+            open_monitor_settings,
             open_data_dir,
             carry::begin_carry,
             carry::get_carry,
@@ -2192,6 +2238,7 @@ fn main() {
             opencode::start(handle.clone());
             kiro::start(handle.clone());
             activity::start(handle.clone());
+            machine_monitor::start(handle.clone());
             reset_watch::start(handle.clone());
             start_telemetry(handle.clone());
             // Collecting glyphs may read icon resources out of a few executables; do it off the main thread and push when done

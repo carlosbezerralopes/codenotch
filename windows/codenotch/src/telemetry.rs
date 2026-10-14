@@ -3,7 +3,7 @@ mod collector;
 mod parsers;
 mod quota_journal;
 pub(crate) mod quota_index;
-mod store;
+pub(crate) mod store;
 
 use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};

@@ -33,7 +33,7 @@ pub fn open(app: &AppHandle) {
 }
 
 pub fn open_section(app: &AppHandle, section: &str, provider: Option<&str>, window_index: Option<usize>) {
-    if !matches!(section, "history" | "usage") { return; }
+    if !matches!(section, "history" | "usage" | "monitor") { return; }
     let provider = provider.filter(|id| matches!(*id, "claude" | "codex" | "kiro")).map(str::to_string);
     let sequence = NAVIGATION_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
     let route = SettingsNavigation { sequence, section: section.into(), provider, window_index: window_index.filter(|n| *n < 4096) };

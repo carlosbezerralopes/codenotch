@@ -9,6 +9,11 @@ hover card with per-window bars), rebuilt for Windows in Rust + Tauri 2 / WebVie
 No code is copied from the Swift app; the providers are reimplemented from their
 documented behaviour and the wire formats.
 
+The Windows app also has a native [machine monitor](docs/machine-monitor.md):
+CPU, memory, physical disks, GPUs and Ethernet/Wi-Fi below the AI rings. Hover
+shows one resource's recent graph. **Settings → Monitor** saves visibility,
+order, refresh interval and graph window; readings remain in memory.
+
 ## What it shows
 
 | Cell | Source | How it reads it |

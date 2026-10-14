@@ -87,6 +87,29 @@
   .c-head .mark{display:inline-block;width:16px;height:16px;color:var(--ink-2);margin-right:2px}
   .c-head .mark svg{width:16px;height:16px;fill:currentColor}
   .pct{font-size:15px;font-weight:600;color:var(--ink);font-variant-numeric:tabular-nums}
+  #pill{--provider-scale:1;--hardware-scale:1;--cell-gap:14px;gap:var(--cell-gap)}
+  #pill>.cell{--ring:calc(44px * var(--provider-scale));--k:calc(44 / 56 * var(--provider-scale));gap:calc(6px * var(--provider-scale))}
+  #pill>.cell>.pct{font-size:calc(15px * var(--provider-scale));line-height:calc(18px * var(--provider-scale))}
+  #pill>.machine-cell{--ring:calc(36px * var(--hardware-scale));--k:calc(36 / 56 * var(--hardware-scale));gap:calc(2px * var(--hardware-scale))}
+  #pill>.machine-cell>.pct{font-size:calc(11px * var(--hardware-scale));line-height:calc(12px * var(--hardware-scale))}
+  .machine-label{font-size:calc(9px * var(--hardware-scale));line-height:calc(10px * var(--hardware-scale));color:var(--ink-4);white-space:nowrap}
+  .machine-cell:focus-visible{outline:1px solid var(--ink-dim);outline-offset:3px;border-radius:8px}
+  .machine-glyph svg{width:calc(23px * var(--hardware-scale));height:calc(23px * var(--hardware-scale))}
+  .machine-vendor{font-size:calc(7px * var(--hardware-scale));font-weight:700;letter-spacing:-.3px}
+  .machine-divider{flex:none;width:28px;height:1px;background:var(--edge)}
+  body[data-edge="top"] .machine-divider,body[data-edge="bottom"] .machine-divider{width:1px;height:28px}
+  #card.machine-card{overflow:hidden;padding:12px}
+  .machine-head{display:flex;gap:7px;align-items:center;font-size:12px;line-height:16px}
+  .machine-head>span{width:20px;height:20px;display:flex;align-items:center;justify-content:center;flex:none}
+  .machine-head svg{width:18px;height:18px}
+  .machine-context,.machine-note{font-size:10px;line-height:13px;color:var(--ink-dim);display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden}
+  .machine-context{margin-top:3px}
+  .machine-value{font-size:19px;line-height:25px;margin:3px 0;font-variant-numeric:tabular-nums}
+  .machine-value small{font-size:9px;color:var(--ink-dim);margin-left:5px}
+  .machine-chart{width:100%;height:56px;display:block;overflow:visible}
+  .machine-axis,.machine-rates{display:flex;justify-content:space-between;font-size:9px;line-height:15px;color:var(--ink-4);font-variant-numeric:tabular-nums}
+  .machine-rates>span:first-child{color:var(--ample)}.machine-rates>span:last-child{color:var(--watch)}
+  .machine-note{margin-top:4px;-webkit-line-clamp:1}
   .dim{opacity:.55}
   /* A stale reading dims the reading only. The track, the week and the glyph are all saying the same
      old thing, but whether an agent is running right now is current either way, so the activity arc
@@ -340,9 +363,14 @@
   <div id="notice"></div>
 </div>
 <script src="usage-insights.js"></script>
+<script src="machine-monitor.js"></script>
 <script>
 const invoke = window.__TAURI__.core.invoke;
 const listen = window.__TAURI__.event.listen;
+const machineMonitor = MachineMonitor.createController({invoke,listen,onChange:()=>{
+  renderRing();
+  if(card.classList.contains('show')){renderCard();armWatchdog();}
+},onError:message=>notice(message)});
 
 /* Colour ramp (upstream palette values) */
 let AMPLE='#00FF88', WATCH='#F2FF00', CRIT='#FF3F00';
@@ -1277,12 +1305,13 @@ function dashedArc(r,frac,color,width,extra=''){
 
 function renderRing(){
   const ps=providers();
+  const hardware=machineMonitor.visible();
   // Rebuild the DOM only when the structure changes (never swap the element under the cursor)
-  const want=ps.map(p=>p.id+':'+(glyphs[p.base]?glyphs[p.base].kind:'-')).join(',');
+  const want=ps.map(p=>p.id+':'+(glyphs[p.base]?glyphs[p.base].kind:'-')).join(',')+'|'+hardware.map(r=>r.id+':'+r.kind+':'+r.vendor).join(',');
   if(pill.dataset.cells!==want){
     pill.innerHTML=ps.map((p,i)=>`<div class="cell" data-p="${p.id}" style="--i:${i}">
       <div class="ringwrap"><svg class="ring" viewBox="0 0 56 56"></svg><svg class="reading" viewBox="0 0 56 56"></svg><svg class="activity" viewBox="0 0 56 56"></svg><div class="glyph ${(!glyphs[p.base]&&p.glyph.length>1)?'small':''}">${glyphHtml(p)}</div></div>
-      <div class="pct">—</div></div>`).join('');
+      <div class="pct">—</div></div>`).join('')+(ps.length&&hardware.length?'<div class="machine-divider" aria-hidden="true"></div>':'')+hardware.map(MachineMonitor.cellHTML).join('');
     pill.dataset.cells=want;
   }
   for(const p of ps){
@@ -1322,7 +1351,34 @@ function renderRing(){
     glyph.classList.toggle('dim', !!(h && h.used>=1));
     wrap.classList.toggle('stale', staleOf(p.snap));
   }
+  for(const resource of hardware){
+    const cell=[...pill.querySelectorAll('.machine-cell')].find(el=>el.dataset.p==='machine:'+resource.id);
+    if(!cell) continue;
+    const value=machineMonitor.ringValue(resource), actual=MachineMonitor.metricValue(resource);
+    cell.querySelector('svg.ring').innerHTML=`<circle cx="28" cy="28" r="22" fill="${HOLE}"/><circle cx="28" cy="28" r="25" fill="none" stroke="${TRACK}" stroke-width="4"/>`;
+    cell.querySelector('svg.reading').innerHTML=value===null?'':svgArc(25,value/100,tone(value/100),4);
+    cell.querySelector('.pct').textContent=resource.kind==='network'?(actual===null?'—':'↕'):actual===null?'—':Math.round(actual)+'%';
+    cell.querySelector('.machine-label').textContent=MachineMonitor.cellLabel(resource,machineMonitor.snapshot.resources);
+    cell.setAttribute('aria-label',MachineMonitor.resourceTitle(resource,machineMonitor.snapshot.resources)+': '+(resource.kind==='network'?MachineMonitor.formatRate(actual):actual===null?'—':Math.round(actual)+'%'));
+    cell.querySelector('.ringwrap').classList.toggle('stale',resource.status!=='ok');
+  }
+  fitPill();
   reportHot(); // a provider appearing or leaving resizes the pill
+}
+
+// Fit every selected cell, including the flares/handles, inside the current logical viewport.
+function fitPill(){
+  const z=parseFloat(document.documentElement.style.zoom)||1;
+  const vertical=edgeIsVertical(), available=(vertical?innerHeight:innerWidth)/z-100;
+  pill.style.setProperty('--provider-scale','1');pill.style.setProperty('--hardware-scale','1');pill.style.setProperty('--cell-gap','14px');
+  const length=()=>vertical?pill.offsetHeight:pill.offsetWidth;
+  if(length()>available){pill.style.setProperty('--hardware-scale',String(32/36));pill.style.setProperty('--cell-gap','4px');}
+  if(length()>available){
+    const children=[...pill.children], ends=38, gaps=Math.max(0,children.length-1)*4;
+    const scale=Math.max(.05,(available-ends-gaps)/Math.max(1,length()-ends-gaps));
+    pill.style.setProperty('--provider-scale',String(scale));pill.style.setProperty('--hardware-scale',String(32/36*scale));
+    if(length()>available)pill.style.setProperty('--cell-gap','0px');
+  }
 }
 
 function resetCopy(ms){
@@ -1512,6 +1568,13 @@ async function signInClaude(){
 // CLAUDE_AUTH_ACTIONS_END
 function renderCard(){
   const c=document.getElementById('card');
+  if(typeof MachineMonitor!=='undefined'&&MachineMonitor.isHardware(hoverId)){
+    resetActivityDetails();resetQuotaDetails();
+    const resource=machineMonitor.selected(hoverId);
+    if(!resource){hoverId=null;hideCard();return;}
+    c.classList.add('machine-card');c.onclick=null;c.innerHTML=machineMonitor.cardHTML(resource);placeCard();return;
+  }
+  c.classList?.remove('machine-card');
   const list=providers();
   const p=list.find(x=>x.id===hoverId)||list[0];
   if(!p){ hoverId=null; c.innerHTML=''; hideCard(); return; }
@@ -1591,7 +1654,7 @@ function placeCard(){
   // a page zoomed past 1 put the bottom edge's card down behind the pill, which then hid all but its top.
   const z=parseFloat(document.documentElement.style.zoom)||1;
   const box=el=>{ const r=el.getBoundingClientRect(); return {left:r.left/z,top:r.top/z,bottom:r.bottom/z,width:r.width/z,height:r.height/z}; };
-  const cell=pill.querySelector(`.cell[data-p="${hoverId}"]`)||pill;
+  const cell=[...pill.querySelectorAll('.cell')].find(el=>el.dataset.p===hoverId)||pill;
   const cr=box(cell);
   // The point sits on the ring, not the cell, which includes the label below it
   const rr=box(cell.querySelector('.ringwrap')||cell);
@@ -1700,6 +1763,7 @@ function designWidth(){ return edgeIsVertical()?DESIGN_W_UPRIGHT:DESIGN_W_FLAT; 
 function fitZoom(){
   const z=innerWidth/designWidth();
   document.documentElement.style.zoom=(Math.abs(z-1)>0.02)?String(z):'';
+  fitPill();
   return z;
 }
 // `settled` only from the end of a burst of resizes, which is what a landing waits for (land_on_another_screen)
@@ -1778,7 +1842,14 @@ let press=null, dragging=false;
    Rust answers false when no reading is coming (Claude inside its rate-limit wait). */
 const PRESS_MIN=380, PRESS_MAX=6000;
 const refreshing={};
+pill.addEventListener('focusin',e=>{const cell=e.target.closest('.machine-cell');if(cell){hoverId=cell.dataset.p;showCard();}});
+pill.addEventListener('keydown',e=>{
+  const cell=e.target.closest('.machine-cell');if(!cell)return;
+  if(e.key==='Enter'||e.key===' '){e.preventDefault();hoverId=cell.dataset.p;showCard();machineMonitor.refresh();}
+  if(e.key==='Escape'){e.preventDefault();hideCard();}
+});
 function refreshRing(id){
+  if(MachineMonitor.isHardware(id)){machineMonitor.refresh();return;}
   if(refreshing[id]) return;
   refreshing[id]={at:Date.now(),timer:setTimeout(()=>settle(id),PRESS_MAX)};
   renderRing();
@@ -1820,13 +1891,31 @@ document.addEventListener('mousemove',e=>{
    a row lying flat, the same cells laid out the two ways the CSS above does — so it is measured
    from the cells, not from the pill, which is only ever one of the two. Borders included. */
 function carryShape(){
-  const cells=[...pill.querySelectorAll('.cell')], n=Math.max(1,cells.length);
-  const cw=cells[0]?cells[0].offsetWidth:44, ch=cells[0]?cells[0].offsetHeight:70, gap=14, ends=36;
+  const cells=[...pill.querySelectorAll('.cell')], children=[...pill.children];
+  const gap=parseFloat(getComputedStyle(pill).gap)||0, ends=36;
+  const heights=children.map(el=>el.classList.contains('machine-divider')?1:el.offsetHeight);
+  const widths=children.map(el=>el.classList.contains('machine-divider')?1:el.offsetWidth);
+  const measures=sizes=>{
+    const length=ends+sizes.reduce((sum,size)=>sum+size,0)+Math.max(0,sizes.length-1)*gap+2;
+    let at=19;const offsets=[];
+    children.forEach((el,i)=>{if(el.classList.contains('cell'))offsets.push(at+sizes[i]/2-length/2);at+=sizes[i]+gap;});
+    return {length,offsets};
+  };
+  const upright=measures(heights), flat=measures(widths), ch=Math.max(0,...cells.map(el=>el.offsetHeight));
+  const serialized=cells.map(el=>{
+    const clone=el.cloneNode(true), style=getComputedStyle(el);
+    for(const property of ['width','height','gap','--ring','--k'])clone.style.setProperty(property,style.getPropertyValue(property));
+    for(const [index,node] of [...el.querySelectorAll('.pct,.machine-label,.machine-vendor,.machine-glyph svg')].entries()){
+      const target=clone.querySelectorAll('.pct,.machine-label,.machine-vendor,.machine-glyph svg')[index], computed=getComputedStyle(node);
+      for(const property of ['font-size','line-height','width','height','color'])target.style.setProperty(property,computed.getPropertyValue(property));
+    }
+    return clone.outerHTML;
+  });
   return {
     radius:20, fillet:parseFloat(getComputedStyle(pill).getPropertyValue('--fillet'))||38.7,
-    upright:{depth:70, length:ends+n*ch+(n-1)*gap+2, pitch:ch+gap, inset:34.5},
-    flat:{depth:24+ch+1, length:ends+n*cw+(n-1)*gap+2, pitch:cw+gap, inset:12+ch/2},
-    cells:cells.map(el=>el.outerHTML)
+    upright:{depth:70,length:upright.length,pitch:ch+gap,inset:34.5,offsets:upright.offsets},
+    flat:{depth:24+ch+1,length:flat.length,pitch:Math.max(0,...widths)+gap,inset:12+ch/2,offsets:flat.offsets},
+    cells:serialized
   };
 }
 // Emptied once the overlay has this notch drawn, and shown again where it was put down, after which
@@ -1844,7 +1933,8 @@ document.addEventListener('contextmenu',e=>{
   if(dragging||!pointerInHot(e.clientX,e.clientY)) return;
   // The command returns once the menu has closed, which is when folding may be thought about again
   menuOpen=true;
-  invoke('show_notch_menu',{provider:cellAt(e.clientX,e.clientY)||hoverId}).catch(err=>notice('show_notch_menu failed: '+err))
+  const id=cellAt(e.clientX,e.clientY)||hoverId;
+  (MachineMonitor.isHardware(id)?invoke('open_monitor_settings'):invoke('show_notch_menu',{provider:id})).catch(err=>notice('notch menu failed: '+err))
     .finally(()=>{ menuOpen=false; scheduleFold(); });
 });
 listen('drag_end',()=>{
@@ -2352,6 +2442,7 @@ invoke('get_notch_edge').then(e=>{applyEdge(e);reportDpr();}).catch(()=>reportDp
 loadInitialUsage('codex','get_codex',u=>{codexSnap=u||codexSnap;}).catch(()=>{});
 loadInitialUsage('claude','get_usage',u=>{usage=u||usage;}).catch(e=>notice('get_usage failed: '+e));
 invoke('get_state').then(s=>{stateSnap=s||stateSnap;setUiLanguage(stateSnap.lang_resolved);renderRing();}).catch(()=>{});
+machineMonitor.start();
 setInterval(()=>{renderRing();for(const provider of ['claude','codex','kiro'])refreshInsights(provider);},30_000); // stale state and reset copy move with time
 setInterval(async()=>{
   if(!claudeAuth.busy&&!(hoverId==='claude'&&card.classList.contains('show'))) return;

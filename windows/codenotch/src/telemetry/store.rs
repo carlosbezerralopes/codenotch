@@ -148,7 +148,7 @@ pub(super) fn publish(root:&Path,batch:&Batch)->Result<PathBuf,String> {
     atomic_file(&path,&serde_json::to_vec(batch).map_err(|e|e.to_string())?,false)?;
     Ok(path)
 }
-pub(super) fn atomic_file(path:&Path,bytes:&[u8],replace:bool)->Result<(),String> {
+pub(crate) fn atomic_file(path:&Path,bytes:&[u8],replace:bool)->Result<(),String> {
     let parent=path.parent().ok_or("Destination has no parent")?;
     fs::create_dir_all(parent).map_err(|e|e.to_string())?;
     let temp=parent.join(format!(".{}.tmp",unique_id()));

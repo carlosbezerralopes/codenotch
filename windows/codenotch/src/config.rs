@@ -100,6 +100,9 @@ pub struct Config {
     /// User names keyed by provider identity; never changes which account or quota is read.
     #[serde(default)]
     pub provider_nicknames: BTreeMap<String, String>,
+    /// Machine indicator preferences only. Samples and graph history are never serialized.
+    #[serde(default)]
+    pub machine_monitor: crate::machine_monitor::Settings,
     /// Antigravity's lane on the ring, as the Mac app's "Notch reads": "automatic", "5h" or "weekly"
     #[serde(default = "default_antigravity_limit")]
     pub antigravity_limit: String,
@@ -309,6 +312,7 @@ impl Default for Config {
             notch_slots: Vec::new(),     // filled in by load(), from notch_providers
             provider_order: Vec::new(),
             provider_nicknames: BTreeMap::new(),
+            machine_monitor: Default::default(),
             antigravity_limit: default_antigravity_limit(),
             antigravity_model: default_antigravity_model(),
             glm_notch_fixed: true, // a fresh install picks from the full list already
@@ -333,8 +337,11 @@ pub fn config_path() -> PathBuf {
 }
 
 pub fn load() -> Config {
-    let path = config_path();
-    let raw = std::fs::read_to_string(&path).ok();
+    load_from(&config_path())
+}
+
+fn load_from(path: &std::path::Path) -> Config {
+    let raw = std::fs::read_to_string(path).ok();
     let mut cfg: Config = raw
         .as_deref()
         .and_then(|t| serde_json::from_str(t).ok())
@@ -375,6 +382,7 @@ pub fn load() -> Config {
     // Mac's own init does: critical first, then watch below it.
     cfg.critical_limit = cfg.critical_limit.clamp(0.02, 1.0);
     cfg.watch_limit = clamp_watch_limit(cfg.watch_limit, cfg.critical_limit);
+    cfg.machine_monitor = cfg.machine_monitor.validate().unwrap_or_default();
     cfg
 }
 
@@ -471,16 +479,74 @@ pub fn save(cfg: &Config) {
 }
 
 pub fn save_checked(cfg: &Config) -> Result<(), String> {
-    let path = config_path();
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
-    }
+    save_checked_to(cfg, &config_path())
+}
+
+fn save_checked_to(cfg: &Config, path: &std::path::Path) -> Result<(), String> {
     let text = serde_json::to_string_pretty(cfg).map_err(|error| error.to_string())?;
-    std::fs::write(path, text).map_err(|error| error.to_string())
+    crate::telemetry::store::atomic_file(path, text.as_bytes(), true)
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn machine_preferences_survive_file_reload_and_preserve_other_preferences() {
+        let root = std::env::temp_dir().join("codenotch").join(format!(
+            "machine-monitor-persistence-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        ));
+        let path = root.join("config.json");
+        let mut cfg = super::Config::default();
+        cfg.provider_order = vec!["kiro".into(), "codex".into()];
+        cfg.machine_monitor.enabled = false;
+        cfg.machine_monitor.refresh_seconds = 10;
+        cfg.machine_monitor.history_minutes = 15;
+        cfg.machine_monitor.order = vec!["memory".into(), "cpu".into(), "gpu-disconnected".into()];
+        cfg.machine_monitor.hidden = cfg.machine_monitor.order.clone();
+        super::save_checked_to(&cfg, &path).unwrap();
+        let restored = super::load_from(&path);
+        assert_eq!(restored.machine_monitor, cfg.machine_monitor);
+        assert_eq!(restored.provider_order, cfg.provider_order);
+        let bytes = std::fs::read_to_string(&path).unwrap();
+        assert!(!bytes.contains("sampled_at"));
+        assert!(!bytes.contains("read_bps"));
+        cfg.machine_monitor.enabled = true;
+        cfg.machine_monitor.order.swap(0, 1);
+        super::save_checked_to(&cfg, &path).unwrap();
+        assert_eq!(super::load_from(&path).machine_monitor, cfg.machine_monitor);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+    }
+
+    #[test]
+    fn legacy_config_gets_monitor_defaults_without_losing_provider_order() {
+        let cfg: super::Config = serde_json::from_str(r#"{"provider_order":["kiro","codex"]}"#).unwrap();
+        assert_eq!(cfg.provider_order, ["kiro", "codex"]);
+        assert_eq!(cfg.machine_monitor.refresh_seconds, 3);
+        assert_eq!(cfg.machine_monitor.history_minutes, 5);
+        assert!(cfg.machine_monitor.order.is_empty());
+        assert!(cfg.machine_monitor.hidden.is_empty());
+    }
+
+    #[test]
+    fn failed_checked_save_keeps_existing_configuration() {
+        let root = std::env::temp_dir().join("codenotch").join(format!(
+            "machine-monitor-save-failure-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.json");
+        super::save_checked_to(&super::Config::default(), &path).unwrap();
+        let prior = std::fs::read(&path).unwrap();
+        let blocked_parent = root.join("file-not-directory");
+        std::fs::write(&blocked_parent, "existing").unwrap();
+        assert!(super::save_checked_to(&super::Config::default(), &blocked_parent.join("config.json")).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), prior);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(blocked_parent).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
     #[test]
     fn presentation_migration_retains_absent_ids_and_explicit_order() {
         let mut old: super::Config = serde_json::from_str(

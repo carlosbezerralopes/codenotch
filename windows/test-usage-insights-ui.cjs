@@ -62,7 +62,7 @@ test('Claude account matches original window index, identity and group after fil
   assert.equal(second.id,'weekly');assert.equal(second.insight_window_id,'weekly@second');assert.equal(second.insight_window_index,3);assert.equal(second.group,'B');
 });
 test('Actual notch card expands Claude, Codex and Kiro DTOs while preserving official bar and hidden activity',async()=>{
-  const card={innerHTML:'',querySelector:()=>null,classList:{contains:()=>false}};
+  const card={innerHTML:'',querySelector:()=>null,classList:{contains:()=>false,remove:()=>{}}};
   let p={id:'codex',base:'codex',name:'Codex',snap:{status:'ok',windows:[{id:'weekly_all',label:'Weekly',used:0.25,resets_at:fixture().period.reset_ms}]}};
   const c=context({document:{getElementById:()=>card},card,uiLang:'pt-BR',providers:()=>[p],hoverId:'codex',glyphHtml:()=>'',
     staleOf:()=>false,ui:()=>({locale:'pt-BR',title:x=>x}),esc:x=>x,textCopy:x=>x,resetCopy:()=>'',tone:()=> '#fff',usedCopy:()=> '25% used',creditAmountsHtml:()=>'',offersClaudeSignIn:()=>false,placeCard:()=>{},
@@ -252,7 +252,7 @@ test('Quota disclosure toggle survives refresh and closes on account change or i
 });
 
 test('Quota click stops propagation and never invokes activity revelation',async()=>{
-  const card={innerHTML:'',querySelector:()=>null,classList:{contains:()=>false}},p={id:'claude',base:'claude',name:'Claude',snap:{status:'ok',windows:[{id:'weekly_all',label:'Weekly',used:.25,resets_at:fixture().period.reset_ms}]}},calls=[];
+  const card={innerHTML:'',querySelector:()=>null,classList:{contains:()=>false,remove:()=>{}}},p={id:'claude',base:'claude',name:'Claude',snap:{status:'ok',windows:[{id:'weekly_all',label:'Weekly',used:.25,resets_at:fixture().period.reset_ms}]}},calls=[];
   const c=context({document:{getElementById:()=>card},card,uiLang:'en',providers:()=>[p],hoverId:'claude',glyphHtml:()=>'',staleOf:()=>false,ui:()=>({title:x=>x}),esc:x=>x,textCopy:x=>x,resetCopy:()=>'',tone:()=> '#fff',usedCopy:()=> '25% used',creditAmountsHtml:()=>'',offersClaudeSignIn:()=>false,placeCard(){},selectActivityProvider(){},activityPrivacyHtml:()=>'',activityPrivacyClick:()=>calls.push('activity'),invoke:async()=>({provider:'claude',windows:[fixture()]})});
   vm.runInContext(section(notch,'TESTABLE WORK PACE')+'\n'+fn(notch,'renderCard'),c);await c.refreshInsights('claude');c.renderCard();
   let stopped=false;card.onclick({target:{closest:()=>({tagName:'SUMMARY'})},stopPropagation(){stopped=true;}});
