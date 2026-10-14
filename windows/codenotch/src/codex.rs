@@ -29,7 +29,7 @@
 //! Credentials are borrowed, never managed: the numbers come from Codex's own sign-in and Codex's
 //! own endpoint. No sign-in and no session history at all means absent (no cell is shown).
 
-use crate::usage::{LimitWindow, UsageSnapshot};
+use crate::usage::{quota_key, LimitWindow, QuotaReadingTransport, QuotaResetBasis, UsageSnapshot};
 use crate::AppState;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -302,6 +302,10 @@ fn window_from(
         label: label_for(num(w.get("limit_window_seconds")).map(|s| s / 60.0), fallback),
         used: (pct / 100.0).clamp(0.0, 1.0),
         resets_at: reset_at_ms(w, now, "reset_at", "reset_after_seconds"),
+        reading_transport: Some(QuotaReadingTransport::CodexHttp),
+        reset_basis: Some(if num(w.get("reset_at")).and_then(secs_to_ms).is_some() { QuotaResetBasis::Absolute }
+            else if num(w.get("reset_after_seconds")).and_then(secs_to_ms).is_some() { QuotaResetBasis::Relative }
+            else { QuotaResetBasis::Unknown }),
         duration_seconds: duration_seconds(num(w.get("limit_window_seconds")), 1.0),
         group: group.map(str::to_string),
         ..Default::default()
@@ -391,6 +395,13 @@ fn windows_from_usage(v: &serde_json::Value) -> Vec<LimitWindow> {
         &mut out,
     );
     out
+}
+
+fn attach_http_identity(windows: &mut [LimitWindow], account_id: &str) {
+    for w in windows {
+        w.quota_account_key = Some(quota_key(&("quota-account-v1", "codex", account_id)));
+        w.quota_bucket_key = Some(quota_key(&("quota-bucket-v1", "codex", &w.id)));
+    }
 }
 
 // ---------------- Fallback: the rollout snapshot ----------------
@@ -511,6 +522,9 @@ pub fn snapshot_from_rollout(text: &str) -> Option<(Vec<LimitWindow>, Option<u64
                 label: label_for(num(w.get("window_minutes")), id),
                 used: (pct / 100.0).clamp(0.0, 1.0),
                 resets_at: reset_at_ms(w, now, "resets_at", "resets_in_seconds"),
+                reading_transport: Some(QuotaReadingTransport::CodexRollout),
+                reset_basis: Some(if num(w.get("resets_at")).and_then(secs_to_ms).is_some() { QuotaResetBasis::Absolute }
+                    else { QuotaResetBasis::Relative }),
                 duration_seconds: duration_seconds(num(w.get("window_minutes")), 60.0),
                 ..Default::default()
             });
@@ -558,6 +572,9 @@ fn app_server_snapshot(result: &serde_json::Value) -> Option<UsageSnapshot> {
             label: label_for(w.get("windowDurationMins").and_then(|x| x.as_f64()), id),
             used: (used / 100.0).clamp(0.0, 1.0),
             resets_at: w.get("resetsAt").and_then(|x| x.as_u64()).map(|s| s.saturating_mul(1000)),
+            reading_transport: Some(QuotaReadingTransport::CodexAppServer),
+            reset_basis: Some(if w.get("resetsAt").and_then(|x| x.as_u64()).is_some() { QuotaResetBasis::Absolute }
+                else { QuotaResetBasis::Unknown }),
             duration_seconds: duration_seconds(w.get("windowDurationMins").and_then(|x| x.as_f64()), 60.0),
             ..Default::default()
         });
@@ -635,7 +652,8 @@ fn read_once() -> UsageSnapshot {
             }
             Some(cred) => match fetch_usage(&cred) {
                 Ok(v) => {
-                    let windows = windows_from_usage(&v);
+                    let mut windows = windows_from_usage(&v);
+                    attach_http_identity(&mut windows, &cred.account_id);
                     if !windows.is_empty() {
                         let plan = v.get("plan_type").and_then(|x| x.as_str()).map(String::from).or(cred.plan);
                         snap.status = "ok".into();
@@ -799,6 +817,22 @@ pub fn probe() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn source_capability_requires_http_success_identity_and_absolute_reset() {
+        use super::*;
+        let v=serde_json::json!({"rate_limit":{"primary_window":{"used_percent":20,"limit_window_seconds":604800,"reset_at":1800000000u64},
+            "secondary_window":{"used_percent":30,"limit_window_seconds":604800,"reset_after_seconds":100}}});
+        let mut rows=windows_from_usage(&v);
+        assert!(rows.iter().all(|w| w.quota_account_key.is_none()));
+        assert_eq!(rows[0].reset_basis,Some(QuotaResetBasis::Absolute));
+        assert_eq!(rows[1].reset_basis,Some(QuotaResetBasis::Relative));
+        attach_http_identity(&mut rows,"synthetic-account");
+        assert_eq!(rows[0].quota_account_key,rows[1].quota_account_key);
+        assert_ne!(rows[0].quota_bucket_key,rows[1].quota_bucket_key);
+        let native=app_server_snapshot(&serde_json::json!({"rateLimits":{"primary":{"usedPercent":20,"windowDurationMins":10080,"resetsAt":1800000000u64}}})).unwrap();
+        assert!(native.windows[0].quota_account_key.is_none());
+        assert_eq!(native.windows[0].reading_transport,Some(QuotaReadingTransport::CodexAppServer));
+    }
     #[test]
     fn duration_is_preserved_from_all_transports_without_guessing_from_ids() {
         let http=window_from(&serde_json::json!({"used_percent":1,"limit_window_seconds":604800}),"primary","primary",0,None).unwrap();

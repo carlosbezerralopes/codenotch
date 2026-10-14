@@ -26,7 +26,10 @@ jobs:
       # their script stays green through the build and ships as an empty
       # window. Node is already on the runner.
       - name: Check the UI pages parse
-        run: node scripts/check-ui-scripts.mjs
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          node scripts/check-ui-scripts.mjs
+          node --check codenotch/ui/usage-insights.js
 
       - name: Test update controls
         run: node scripts/test-update-ui.cjs
@@ -62,7 +65,7 @@ jobs:
         run: node --test test-kiro.cjs scripts/test-fork-updates.cjs
 
       - name: Test credits, presentation, telemetry, privacy and working pace
-        run: node --test test-kiro-credits.cjs test-provider-presentation.cjs test-telemetry-ui.cjs test-activity-privacy.cjs test-work-pace.cjs
+        run: node --test test-kiro-credits.cjs test-provider-presentation.cjs test-telemetry-ui.cjs test-settings-history.cjs test-usage-insights-ui.cjs test-activity-privacy.cjs test-work-pace.cjs
 
       - name: Test Codex headline selection
         run: node --test test-codex-headline.cjs

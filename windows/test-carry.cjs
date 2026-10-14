@@ -140,9 +140,12 @@ test('the notch and the drawing of it show the same settings end, frame for fram
   // They hand over at any moment of it, so a difference between the two copies is a jump on screen
   const notch = readFileSync(join(__dirname, 'codenotch/ui/notch.html'), 'utf8');
   const pick = (source, start, end) => {
+    source = source.replace(/\r\n/g, '\n');
     const a = source.indexOf(start);
     assert.ok(a >= 0, `missing ${start}`);
-    return source.slice(a, source.indexOf(end, a) + end.length);
+    const b = source.indexOf(end, a);
+    assert.ok(b >= a, `missing end of ${start}`);
+    return source.slice(a, b + end.length);
   };
   for (const [start, end] of [['const smooth=x=>', '};\n'], ['const clamp01=x=>', ';\n'], ['function handleFrame(c,now){', '\n}\n'],
     ['function quarter(', '\n}\n'], ['function strand(', '\n}\n'], ['function discMerge(', '\n}\n']]) {

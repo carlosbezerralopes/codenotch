@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Monitor de atividade · Codenotch</title>
+  <link rel="stylesheet" href="monitor.css">
+  <script src="monitor.js" defer></script>
+</head>
+<body>
+  <header class="page-header">
+    <div class="brand"><span class="brand-mark" aria-hidden="true">◒</span><div><h1>Monitor de atividade</h1><p>Codenotch <span>·</span> Protótipo Windows</p></div></div>
+    <div class="toolbar" aria-label="Controles do monitor">
+      <label>Atualização <select id="interval"><option value="3000">3 s</option><option value="5000">5 s</option><option value="10000">10 s</option></select></label>
+      <label>Histórico <select id="window"><option value="60000">1 min</option><option value="300000" selected>5 min</option><option value="900000">15 min</option></select></label>
+      <button id="pause" type="button">Pausar</button>
+      <button id="theme" type="button" aria-label="Alternar para tema claro">Claro</button>
+      <button id="indicators" type="button">Indicadores</button>
+    </div>
+  </header>
+  <main class="desktop" aria-label="Prévia do monitor na borda da tela">
+    <div class="desktop-caption" aria-hidden="true"><span>UM OLHAR, SEM INTERROMPER.</span><p>A atividade do seu computador,<br>junto dos seus assistentes.</p><i></i></div>
+    <section id="flyout" class="flyout" aria-label="Detalhes do recurso selecionado" hidden>
+      <header class="flyout-heading"><span id="detail-source" class="eyebrow">ESTE COMPUTADOR</span><span id="live-badge" class="live-badge">Conectando</span><button id="close-detail" class="icon-button" type="button" aria-label="Fechar detalhe">×</button></header>
+      <div id="error" class="error" hidden><p id="error-text"></p><button id="retry" type="button">Reconectar</button></div>
+      <section class="detail" aria-labelledby="detail-title">
+        <div class="detail-heading"><div><h3 id="detail-title">CPU</h3><p id="detail-name">Aguardando leitura do Windows</p></div><strong id="detail-value">—</strong></div>
+        <div class="chart-labels"><span id="chart-unit">Utilização</span><span id="chart-ceiling">100%</span></div>
+        <svg id="chart" class="history-chart" viewBox="0 0 300 108" role="img" aria-label="Histórico do recurso selecionado"></svg>
+        <div class="chart-axis"><span id="axis-start">−5 min</span><span>agora</span></div>
+        <p id="chart-note" class="chart-note">O histórico começa com a primeira leitura.</p>
+        <dl id="detail-facts" class="facts"></dl>
+      </section>
+      <footer class="flyout-footer"><span class="status-dot" id="status-dot"></span><span id="status" role="status">Conectando à coleta local…</span></footer>
+    </section>
+    <nav id="pill" class="pill" aria-label="Indicadores Codenotch">
+      <div id="ai-rings" class="ring-group" aria-label="Cotas ilustrativas de IA"></div>
+      <div id="pill-divider" class="pill-divider" role="separator"></div>
+      <div id="hardware-rings" class="ring-group" aria-label="Recursos do computador"></div>
+      <button id="gear" class="gear icon-button" type="button" aria-label="Escolher e ordenar indicadores">⚙</button>
+    </nav>
+    <p id="empty-hint" class="empty-hint" hidden>Indicadores ocultos. Escolha o que mostrar em <button id="empty-menu" type="button">Indicadores</button>.</p>
+  </main>
+  <footer class="page-footer"><span>Histórico só nesta janela</span><span id="page-status" role="status">Conectando à coleta local…</span><span>Cotas de IA ilustrativas</span></footer>
+  <dialog id="indicator-menu" aria-labelledby="menu-title">
+    <header class="menu-heading"><div><h2 id="menu-title">Indicadores</h2><p>Visibilidade e ordem nesta janela</p></div><button id="close-menu" class="icon-button" type="button" aria-label="Fechar menu de indicadores">×</button></header>
+    <div class="menu-tabs" role="tablist" aria-label="Grupo de indicadores"><button id="tab-ai" role="tab" aria-selected="true" aria-controls="menu-ai" type="button">Assistentes</button><button id="tab-hardware" role="tab" aria-selected="false" aria-controls="menu-hardware" type="button">Computador</button></div>
+    <div class="menu-groups"><section id="menu-ai" aria-label="Indicadores de IA"><h3>Assistentes <span>· ilustrativos</span></h3><div id="ai-options"></div></section><section id="menu-hardware" aria-label="Indicadores do computador"><h3>Computador</h3><div id="hardware-options"></div></section></div>
+    <p class="menu-note">As setas alteram a ordem dentro de cada grupo.</p>
+  </dialog>
+</body>
+</html>

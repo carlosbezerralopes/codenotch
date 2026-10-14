@@ -9,6 +9,7 @@ const end = '// END TESTABLE ACTIVITY PRIVACY';
 assert.equal(source.split(begin).length, 2);
 assert.equal(source.split(end).length, 2);
 const privacy = source.split(begin)[1].split(end)[0];
+const insights = readFileSync(join(__dirname, 'codenotch/ui/usage-insights.js'), 'utf8');
 const pace = source.split('// BEGIN TESTABLE WORK PACE')[1].split('// END TESTABLE WORK PACE')[0];
 function fn(name) {
   const start = source.indexOf(`function ${name}(`);
@@ -47,7 +48,7 @@ function fixture(base = 'claude', lang = 'pt-BR') {
     moreRow: count => count > 0 ? `<div>${count} more</div>` : '', placeCard: () => {}, reportHot: () => {},
     hideTimer: null, clearTimeout: () => {}, armWatchdog: () => {}, refreshClock: () => {},
   });
-  vm.runInContext([privacy, pace, fn('renderCard'), oneLine('showCard'), oneLine('hideCard')].join('\n'), c);
+  vm.runInContext([insights, privacy, pace, fn('renderCard'), oneLine('showCard'), oneLine('hideCard')].join('\n'), c);
   return { c, card, toggle, signIn, setProvider: value => { p = value; c.hoverId = value?.id ?? null; } };
 }
 function click(card, control = 'card') {

@@ -1,6 +1,8 @@
 # Histórico local de consumo
 
-Na primeira abertura, escolha a pasta em **Telemetria**. O aplicativo sugere
+Abra **Configurações → Histórico**, também disponível pelo menu da bandeja.
+O histórico é integrado às configurações; fechar a janela não apaga a coleta.
+Na primeira abertura, escolha a pasta nessa seção. O aplicativo sugere
 `Projetos/Codenotch/telemetria` no OneDrive Business; na ausência dele, tenta o
 OneDrive pessoal. É possível procurar outra pasta e alterar a configuração depois.
 Nenhuma coleta começa antes de salvar essa escolha.
@@ -20,7 +22,20 @@ e a âncora do arquivo original conferem; arquivo alterado exige reprocessamento
 seguro. O período inicial dos relatórios não apaga consumo já lido.
 
 Os arquivos são gravados e confirmados no sistema de arquivos antes de avançar
-a leitura. A sincronização para a nuvem é responsabilidade do OneDrive: a gravação
+a leitura. Leituras oficiais de cota e referências derivadas são gravadas
+separadamente em `quota-readings`, por máquina e instalação. Elas preservam
+as datas e a validade de cada janela/conta e não entram nos totais de consumo.
+Repetir uma leitura não cria outro arquivo. Falhas de gravação permanecem
+visíveis no relatório até uma gravação bem-sucedida ou mudança de configuração.
+
+As leituras novas de cota usam o journal V2, organizado por data UTC, sem
+reescrever arquivos V1 existentes. A identificação de conta e cota é opaca e
+vem da fonte verificável; nenhum token de autenticação é gravado. Um índice
+local separado lê essas pastas em partes no background e serve as projeções
+sem varrer o OneDrive ao abrir um cartão. Arquivos incompletos ou conflitantes
+permanecem preservados e impedem uma previsão tratada como confiável.
+
+A sincronização para a nuvem é responsabilidade do OneDrive: a gravação
 local não confirma que o serviço já enviou o arquivo. Aguarde a sincronização do
 OneDrive antes de formatar ou de esperar que outra máquina veja os mesmos dados.
 
@@ -75,3 +90,6 @@ No diretório `windows/`, execute `node --test test-telemetry-ui.cjs` e
 retomada, cópias entre máquinas, repetição de snapshots, valores desconhecidos e
 falhas de armazenamento. Eles não comprovam sincronização na nuvem nem substituem
 a validação da cobertura das sessões reais após instalar o aplicativo.
+
+A pausa de consultas de cota do Kiro não interrompe a leitura do histórico local.
+Veja a [política de atualização Kiro](kiro-polling.md).

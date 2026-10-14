@@ -74,7 +74,7 @@ function controller(api){
   for(const id of ['directory','machine','enabled','history-days','utc-offset','mappings','first-use','setup','history','save','browse','retry','refresh','from-date','to-date','grain','provider','filter-machine','project','folder','unknown-project','unknown-folder','columns','rows','totals','scan','coverage','issues','truncated','events','status','add-mapping','filters'])node(id);
   node('grain').value='day';
   const document={getElementById:node,querySelectorAll:()=>[],documentElement:{dataset:{}},hidden:false};
-  const c=vm.createContext({Intl,document,window:{__TAURI__:{core:{invoke:api},event:{listen:()=>Promise.resolve()}}},setInterval:()=>{},console});
+  const c=vm.createContext({Intl,URL,URLSearchParams,document,window:{location:{search:'',href:'https://tauri.localhost/telemetry.html'},addEventListener:()=>{},__TAURI__:{core:{invoke:api},event:{listen:()=>Promise.resolve()}}},setInterval:()=>{},clearInterval:()=>{},console});
   vm.runInContext(script.replace('initialize();',''),c);
   return {c,nodes,set:(key,value)=>{c.injected=value;vm.runInContext(`${key}=injected`,c);}};
 }

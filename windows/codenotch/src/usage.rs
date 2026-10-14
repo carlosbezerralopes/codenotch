@@ -132,6 +132,40 @@ pub struct CreditAmounts {
     pub allowance: f64,
 }
 
+/// A reported credit pair is not necessarily the renewing plan's allowance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CreditScope {
+    Plan,
+    Combined,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaReadingTransport {
+    ClaudeUsageHttp, CodexHttp, CodexAppServer, CodexRollout, KiroCli, KiroUsageApi,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaResetBasis { Absolute, Relative, OfficialCalendarMonth, Unknown }
+
+pub(crate) fn quota_key<T: Serialize>(tuple: &T) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(serde_json::to_vec(tuple).expect("quota key tuple is serializable")))
+}
+
+pub(crate) fn canonical_window_kind(provider: &str, id: &str) -> String {
+    let kind = id.split('@').next().unwrap_or(id);
+    (if provider == "claude" { match kind {
+        "five_hour" | "session" => "session",
+        "seven_day" | "weekly_all" | "weekly" => "weekly_all",
+        "seven_day_opus" | "weekly_opus" => "weekly_opus",
+        other => other,
+    }} else { kind }).into()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LimitWindow {
     pub id: String,
@@ -152,9 +186,24 @@ pub struct LimitWindow {
     pub group: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credits: Option<CreditAmounts>,
-    /// Provider-reported duration; missing means the cycle start cannot be reconstructed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credit_scope: Option<CreditScope>,
+    /// Reported duration or confirmed provider semantics; never inferred from a display label.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_seconds: Option<u64>,
+    /// Observation age/status belong to this account's reading, not an aggregate's latest account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reading_fetched_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reading_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_account_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_bucket_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reading_transport: Option<QuotaReadingTransport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_basis: Option<QuotaResetBasis>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -439,6 +488,17 @@ fn label_for(kind: &str) -> String {
     }
 }
 
+/// Claude documents five-hour sessions and weekly limits. Unknown kinds stay unknown.
+/// https://support.claude.com/en/articles/11647753-how-do-usage-and-length-limits-work
+pub(crate) fn claude_duration_seconds(kind: &str) -> Option<u64> {
+    match kind {
+        "session" | "five_hour" => Some(5 * 3600),
+        "seven_day" | "weekly_all" | "weekly" | "weekly_scoped"
+        | "seven_day_opus" | "weekly_opus" => Some(7 * 86400),
+        _ => None,
+    }
+}
+
 fn parse_response(v: &serde_json::Value) -> Vec<LimitWindow> {
     let mut out: Vec<LimitWindow> = Vec::new();
     if let Some(arr) = v.get("limits").and_then(|x| x.as_array()) {
@@ -457,14 +517,15 @@ fn parse_response(v: &serde_json::Value) -> Vec<LimitWindow> {
                 id: kind.to_string(),
                 label: label_for(kind),
                 used: (pct / 100.0).clamp(0.0, 1.0),
-                resets_at: resets, ..Default::default()
+                resets_at: resets,
+                reading_transport: Some(QuotaReadingTransport::ClaudeUsageHttp),
+                reset_basis: Some(QuotaResetBasis::Absolute),
+                duration_seconds: claude_duration_seconds(kind), ..Default::default()
             });
         }
     }
     // Fallback merge: a window that just rolled over disappears from limits while the named field remains.
-    // In practice the kinds in limits are weekly_all/weekly_scoped, not seven_day — deduplicating by id
-    // alone would add the seven_day fallback a second time (the card showed "Weekly all" and
-    // "Weekly (all models)" as twins). Three dedupe rules: id alias / same resets_at and percentage / same label.
+    // Only known aliases prove the same lane; equal values/reset times do not prove scope.
     let aliases: [(&str, &str, &[&str]); 2] = [
         ("five_hour", "session", &["session", "five_hour"]),
         ("seven_day", "seven_day", &["seven_day", "weekly_all", "weekly"]),
@@ -475,17 +536,14 @@ fn parse_response(v: &serde_json::Value) -> Vec<LimitWindow> {
         let used = (u / 100.0).clamp(0.0, 1.0);
         let resets_at = w.get("resets_at").and_then(parse_reset);
         let label = label_for(id);
-        let dup = out.iter().any(|x| {
-            alias.contains(&x.id.as_str())
-                || x.label == label
-                || (resets_at.is_some()
-                    && x.resets_at.map(|r| r / 1000) == resets_at.map(|r| r / 1000)
-                    && (x.used - used).abs() < 0.005)
-        });
+        let dup = out.iter().any(|x| alias.contains(&x.id.as_str()));
         if dup {
             continue;
         }
-        out.push(LimitWindow { id: id.into(), label, used, resets_at, ..Default::default() });
+        out.push(LimitWindow { id: id.into(), label, used, resets_at,
+            reading_transport: Some(QuotaReadingTransport::ClaudeUsageHttp),
+            reset_basis: Some(if resets_at.is_some() { QuotaResetBasis::Absolute } else { QuotaResetBasis::Unknown }),
+            duration_seconds: claude_duration_seconds(id), ..Default::default() });
     }
     // session always comes first (upstream display order)
     out.sort_by_key(|w| if w.id == "session" { 0 } else { 1 });
@@ -498,7 +556,85 @@ enum FetchErr {
     Other(String),
 }
 
-fn fetch_once(token: &str) -> Result<Vec<LimitWindow>, FetchErr> {
+#[derive(Clone, PartialEq, Eq)]
+struct ClaudeProfileMetadata { account_uuid: String, organization_uuid: String, rate_limit_tier: Option<String> }
+
+fn canonical_uuid(s: &str) -> Option<String> {
+    (s.len() == 36 && s.bytes().enumerate().all(|(i, b)|
+        if [8, 13, 18, 23].contains(&i) { b == b'-' } else { b.is_ascii_hexdigit() }))
+        .then(|| s.to_ascii_lowercase())
+}
+fn parse_claude_profile_metadata(v: &serde_json::Value) -> Option<ClaudeProfileMetadata> {
+    let account_uuid = canonical_uuid(v.pointer("/account/uuid")?.as_str()?)?;
+    let organization_uuid = canonical_uuid(v.pointer("/organization/uuid")?.as_str()?)?;
+    let rate_limit_tier = match v.pointer("/organization/rate_limit_tier") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => { let s = v.as_str()?;
+            if s.trim().is_empty() || s.chars().any(char::is_control) { return None; }
+            Some(s.to_owned())
+        }
+    };
+    Some(ClaudeProfileMetadata { account_uuid, organization_uuid, rate_limit_tier })
+}
+
+const METADATA_COOLDOWN_MS: u64 = 15 * 60 * 1000;
+const MAX_METADATA_BYTES: usize = 2 * 1024 * 1024;
+#[derive(Default)]
+struct ClaudeMetadataCache {
+    // Same successful credential is a private RAM context, never a persisted identifier.
+    token: String, metadata: Option<ClaudeProfileMetadata>, retry_at_ms: u64,
+}
+impl ClaudeMetadataCache {
+    fn get_with(&mut self, token: &str, at_ms: u64,
+        fetch: impl FnOnce(&str) -> (Option<ClaudeProfileMetadata>, u64)) -> Option<ClaudeProfileMetadata> {
+        if self.token != token { self.token = token.to_owned(); self.metadata = None; self.retry_at_ms = 0; }
+        if self.metadata.is_some() { return self.metadata.clone(); }
+        if at_ms < self.retry_at_ms { return None; }
+        let (metadata, retry_floor_ms) = fetch(token);
+        self.metadata = metadata;
+        self.retry_at_ms = at_ms.saturating_add(METADATA_COOLDOWN_MS.max(retry_floor_ms));
+        self.metadata.clone()
+    }
+}
+fn metadata_retry_floor(r: &ureq::Response) -> u64 {
+    r.header("Retry-After").and_then(|s| s.trim().parse::<u64>().ok().map(|v| v.saturating_mul(1000))
+        .or_else(|| chrono::DateTime::parse_from_rfc2822(s).ok()
+            .map(|d| d.timestamp_millis().saturating_sub(now_ms() as i64).max(0) as u64))).unwrap_or(0)
+}
+fn fetch_claude_profile_metadata(token: &str) -> (Option<ClaudeProfileMetadata>, u64) {
+    let started = now_ms();
+    let (metadata, floor) = fetch_claude_profile_metadata_once(token);
+    (metadata, floor.max(METADATA_COOLDOWN_MS).saturating_add(now_ms().saturating_sub(started)))
+}
+fn fetch_claude_profile_metadata_once(token: &str) -> (Option<ClaudeProfileMetadata>, u64) {
+    use std::io::Read;
+    // A redirect may leave the token's origin; refuse every redirect for metadata.
+    let response = ureq::AgentBuilder::new().redirects(0).timeout(Duration::from_secs(15)).build()
+        .get("https://api.anthropic.com/api/oauth/profile")
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("anthropic-beta", "oauth-2025-04-20").call();
+    let r = match response {
+        Ok(r) if r.status() == 200 => r,
+        Ok(r) | Err(ureq::Error::Status(_, r)) => return (None, metadata_retry_floor(&r)),
+        Err(_) => return (None, 0),
+    };
+    if r.header("Content-Length").and_then(|s| s.parse::<usize>().ok()).is_some_and(|n| n > MAX_METADATA_BYTES) {
+        return (None, 0);
+    }
+    let mut bytes = Vec::new();
+    if r.into_reader().take((MAX_METADATA_BYTES + 1) as u64).read_to_end(&mut bytes).is_err()
+        || bytes.len() > MAX_METADATA_BYTES { return (None, 0); }
+    (serde_json::from_slice(&bytes).ok().and_then(|v| parse_claude_profile_metadata(&v)), 0)
+}
+fn attach_claude_identity(windows: &mut [LimitWindow], metadata: &ClaudeProfileMetadata) {
+    for w in windows {
+        w.quota_account_key = Some(quota_key(&("quota-account-v1", "claude", &metadata.account_uuid)));
+        let kind = w.id.split('@').next().unwrap_or(&w.id);
+        w.quota_bucket_key = Some(quota_key(&("quota-bucket-v1", "claude", &metadata.organization_uuid, kind, &metadata.rate_limit_tier)));
+    }
+}
+
+fn fetch_once(token: &str) -> Result<(Vec<LimitWindow>, u64), FetchErr> {
     let resp = ureq::get(ENDPOINT)
         .set("Authorization", &format!("Bearer {token}"))
         .set("anthropic-beta", "oauth-2025-04-20")
@@ -509,7 +645,7 @@ fn fetch_once(token: &str) -> Result<Vec<LimitWindow>, FetchErr> {
             let v: serde_json::Value = r
                 .into_json()
                 .map_err(|e| FetchErr::Other(format!("parse: {e}")))?;
-            Ok(parse_response(&v))
+            Ok((parse_response(&v), now_ms()))
         }
         Err(ureq::Error::Status(401, _)) => Err(FetchErr::NeedsAuth),
         Err(ureq::Error::Status(403, _)) => Err(FetchErr::Other(
@@ -555,6 +691,7 @@ struct Account {
     status: String,
     note: String,
     fetched_at: u64,
+    metadata: ClaudeMetadataCache,
 }
 
 fn key(p: &Profile) -> String {
@@ -609,7 +746,11 @@ fn aggregate(order: &[Profile], accounts: &HashMap<String, Account>) -> UsageSna
         let Some(a) = accounts.get(&key(p)) else {
             continue;
         };
-        snap.windows.extend(a.windows.iter().cloned());
+        snap.windows.extend(a.windows.iter().cloned().map(|mut w| {
+            w.reading_fetched_at = (a.fetched_at > 0).then_some(a.fetched_at);
+            w.reading_status = (!a.status.is_empty()).then(|| a.status.clone());
+            w
+        }));
         snap.fetched_at = snap.fetched_at.max(a.fetched_at);
         if !a.status.is_empty() && rank(a.status.as_str()) < best {
             best = rank(a.status.as_str());
@@ -655,22 +796,24 @@ fn poll_account(p: &Profile, acc: &mut Account, group: Option<&str>) {
             acc.note = EXPIRED_NOTE.into();
         }
         Some(cred) => {
-            let token = cred.token;
+            let mut token = cred.token;
             // On 401 re-read the credential and retry once (Claude Code may have just refreshed it)
             let result = match fetch_once(&token) {
                 Err(FetchErr::NeedsAuth) => match read_credentials(&p.dir) {
-                    Some(c2) if c2.token != token => fetch_once(&c2.token),
+                    Some(c2) if c2.token != token => { token = c2.token; fetch_once(&token) },
                     _ => Err(FetchErr::NeedsAuth),
                 },
                 other => other,
             };
             match result {
-                Ok(windows) => {
+                Ok((mut windows, received_at)) => {
+                    let metadata = acc.metadata.get_with(&token, received_at, fetch_claude_profile_metadata);
+                    if let Some(metadata) = metadata { attach_claude_identity(&mut windows, &metadata); }
                     crate::claude_auth::usage_succeeded();
                     acc.consecutive_429 = 0;
                     acc.status = "ok".into();
                     acc.windows = decorate(windows, p, group);
-                    acc.fetched_at = now_ms();
+                    acc.fetched_at = received_at;
                     acc.note.clear();
                     acc.backoff_until = 0;
                 }
@@ -712,8 +855,24 @@ pub fn start(app: AppHandle) {
             snap
         };
         let mut accounts: HashMap<String, Account> = HashMap::new();
-        for (k, windows) in split_persisted(&persisted, &profiles()) {
-            accounts.entry(k).or_default().windows = windows;
+        let restore_order = profiles();
+        let legacy_single = restore_order.len() == 1 && persisted.windows.iter().all(|w|
+            w.group.is_none() && !w.id.contains('@') && w.reading_fetched_at.is_none() && w.reading_status.is_none());
+        for (k, windows) in split_persisted(&persisted, &restore_order) {
+            let account = accounts.entry(k).or_default();
+            // Restore only an origin independently carried by every window in this account.
+            // The aggregate's max timestamp can belong to a different account.
+            if let Some(origin) = windows.first().and_then(|w| w.reading_fetched_at.zip(w.reading_status.as_deref())) {
+                if windows.iter().all(|w| w.reading_fetched_at == Some(origin.0)
+                    && w.reading_status.as_deref() == Some(origin.1)) {
+                    account.fetched_at = origin.0;
+                    account.status = origin.1.into();
+                }
+            } else if legacy_single {
+                account.fetched_at = persisted.fetched_at;
+                account.status = persisted.status.clone();
+            }
+            account.windows = windows;
         }
         loop {
             // A sign-in the user started owns the credential until it finishes. Polling through it
@@ -761,18 +920,89 @@ pub fn start(app: AppHandle) {
 
 #[cfg(test)]
 mod tests {
+    fn profile_fixture() -> serde_json::Value { serde_json::json!({
+        "account":{"uuid":"11111111-1111-4111-8111-111111111111", "email":"ignored@example.invalid"},
+        "organization":{"uuid":"22222222-2222-4222-8222-222222222222", "rate_limit_tier":"synthetic_tier"}
+    }) }
+    #[test]
+    fn metadata_uses_only_typed_http_uuid_fields_and_opaque_stable_keys() {
+        let m = parse_claude_profile_metadata(&profile_fixture()).unwrap();
+        let mut a = vec![LimitWindow { id:"weekly_all".into(), ..Default::default() }];
+        attach_claude_identity(&mut a, &m);
+        let mut b = a.clone(); b[0].group = Some("Other local label".into());
+        attach_claude_identity(&mut b, &m);
+        assert_eq!(a[0].quota_account_key, b[0].quota_account_key);
+        assert_eq!(a[0].quota_bucket_key, b[0].quota_bucket_key);
+        assert_eq!(a[0].quota_account_key.as_ref().unwrap().len(), 64);
+        let mut other = m.clone(); other.organization_uuid = "33333333-3333-4333-8333-333333333333".into();
+        attach_claude_identity(&mut b, &other);
+        assert_eq!(a[0].quota_account_key, b[0].quota_account_key);
+        assert_ne!(a[0].quota_bucket_key, b[0].quota_bucket_key);
+        for bad in [serde_json::json!({"oauthAccount":{"accountUuid":m.account_uuid,"organizationUuid":m.organization_uuid}}),
+            serde_json::json!({"account_uuid":"11111111-1111-4111-8111-111111111111"}),
+            serde_json::json!({"account":{"uuid":"ignored@example.invalid"},"organization":{"uuid":m.organization_uuid}}),
+            serde_json::json!({"account":{"uuid":m.account_uuid}})] {
+            assert!(parse_claude_profile_metadata(&bad).is_none());
+        }
+        let mut bad = profile_fixture(); bad["organization"]["rate_limit_tier"] = serde_json::json!("bad\nvalue");
+        assert!(parse_claude_profile_metadata(&bad).is_none());
+        let mut no_tier = profile_fixture(); no_tier["organization"].as_object_mut().unwrap().remove("rate_limit_tier");
+        assert!(parse_claude_profile_metadata(&no_tier).unwrap().rate_limit_tier.is_none());
+    }
+    #[test]
+    fn metadata_rotation_and_failures_are_private_and_cooldown_isolated_from_quota() {
+        let mut cache = ClaudeMetadataCache::default();
+        let m = parse_claude_profile_metadata(&profile_fixture()).unwrap();
+        assert!(cache.get_with("synthetic-A", 1000, |token| { assert_eq!(token,"synthetic-A"); (Some(m.clone()),0) }).is_some());
+        assert!(cache.get_with("synthetic-A", 1001, |_| panic!("success must be reused")).is_some());
+        assert!(cache.get_with("synthetic-B", 2000, |token| { assert_eq!(token,"synthetic-B"); (None,0) }).is_none());
+        assert!(cache.get_with("synthetic-B", 2000 + METADATA_COOLDOWN_MS - 1, |_| panic!("cooldown")).is_none());
+        let restored = cache.get_with("synthetic-B", 2000 + METADATA_COOLDOWN_MS, |_| (Some(m.clone()),0)).unwrap();
+        assert!(restored == m);
+        assert!(cache.get_with("synthetic-C", 2000 + METADATA_COOLDOWN_MS, |_| (None,2*METADATA_COOLDOWN_MS)).is_none());
+        assert!(cache.get_with("synthetic-C", 2000 + 2*METADATA_COOLDOWN_MS, |_| panic!("Retry-After floor")).is_none());
+    }
+    #[test]
+    fn scoped_equal_reset_and_percent_is_not_an_all_models_alias() {
+        let rows = parse_response(&serde_json::json!({"limits":[
+            {"kind":"weekly_scoped","percent":20,"resets_at":"2026-10-14T16:00:00Z"},
+            {"kind":"unknown_weekly_offer","percent":20,"resets_at":"2026-10-14T16:00:00Z"}
+        ],"seven_day":{"utilization":20,"resets_at":"2026-10-14T16:00:00Z"}}));
+        assert_eq!(rows.len(),3);
+        assert!(rows.iter().any(|w| w.id == "seven_day"));
+        assert!(rows.iter().find(|w| w.id == "unknown_weekly_offer").unwrap().duration_seconds.is_none());
+    }
     #[test]
     fn persisted_windows_without_a_duration_stay_compatible() {
         let old: super::LimitWindow = serde_json::from_str(r#"{"id":"secondary","label":"Weekly","used":0.25,"resets_at":null}"#).unwrap();
         assert_eq!(old.duration_seconds,None);
         assert!(old.credits.is_none());
+        assert_eq!(old.credit_scope, None);
+        assert_eq!(old.reading_fetched_at, None);
+        assert_eq!(old.reading_status, None);
         let saved=serde_json::to_value(&old).unwrap();
         assert!(saved.get("duration_seconds").is_none());
+        assert!(saved.get("credit_scope").is_none());
+        assert!(saved.get("reading_fetched_at").is_none());
+        assert!(saved.get("reading_status").is_none());
         let reported=super::LimitWindow { duration_seconds:Some(604800), ..old };
         let restored: super::LimitWindow=serde_json::from_str(&serde_json::to_string(&reported).unwrap()).unwrap();
         assert_eq!(restored.duration_seconds,Some(604800));
     }
     use super::*;
+
+    #[test]
+    fn claude_periods_follow_known_wire_kinds_without_label_guessing() {
+        let parsed = parse_response(&serde_json::json!({"limits": [
+            {"kind":"weekly_scoped","percent":20,"resets_at":"2026-10-14T16:00:00Z"},
+            {"kind":"unknown_weekly_offer","percent":50,"resets_at":"2026-10-14T16:00:00Z"}
+        ], "five_hour":{"utilization":0,"resets_at":"2026-10-12T16:00:00Z"},
+           "seven_day":{"utilization":79,"resets_at":"2026-10-14T16:00:00Z"}}));
+        assert_eq!(parsed.iter().find(|w| w.id == "session").unwrap().duration_seconds, Some(18000));
+        assert_eq!(parsed.iter().find(|w| w.id == "weekly_scoped").unwrap().duration_seconds, Some(604800));
+        assert_eq!(parsed.iter().find(|w| w.id == "seven_day").unwrap().duration_seconds, Some(604800));
+        assert_eq!(parsed.iter().find(|w| w.id == "unknown_weekly_offer").unwrap().duration_seconds, None);
+    }
 
     const EXP: u64 = 1_000_000_000;
 
@@ -903,6 +1133,24 @@ mod tests {
         assert_eq!(snap.windows.len(), 1);
         assert_eq!(snap.fetched_at, 10);
         assert!(snap.note.starts_with("work: "), "the note names the account: {}", snap.note);
+    }
+
+    #[test]
+    fn aggregate_preserves_each_accounts_reading_origin_in_source_order() {
+        let order = vec![prof(None), prof(Some("work"))];
+        let mut accounts: HashMap<String, Account> = HashMap::new();
+        accounts.insert(key(&order[0]), Account { status: "ok".into(), fetched_at: 100_000_000,
+            windows: vec![win("weekly_all")], ..Default::default() });
+        accounts.insert(key(&order[1]), Account { status: "stale".into(), fetched_at: 13_600_000,
+            windows: vec![win("weekly_all@work")], ..Default::default() });
+        let snap = aggregate(&order, &accounts);
+        assert_eq!(snap.fetched_at, 100_000_000);
+        assert_eq!(snap.status, "ok");
+        assert_eq!(snap.windows[0].reading_fetched_at, Some(100_000_000));
+        assert_eq!(snap.windows[0].reading_status.as_deref(), Some("ok"));
+        assert_eq!(snap.windows[1].reading_fetched_at, Some(13_600_000));
+        assert_eq!(snap.windows[1].reading_status.as_deref(), Some("stale"));
+        assert_eq!(snap.windows[1].id, "weekly_all@work");
     }
 
     #[test]

@@ -1,23 +1,23 @@
 # Acesso e revisão
 
-`carlosbezerralopes/codenotch` é privado e foi desvinculado da rede de forks.
-Somente a conta proprietária tem acesso de escrita. Contribuições ao projeto
-original usam um fork público separado com a alteração isolada.
+O destino é `carlosbezerralopes/codenotch`, fork público de `vinzdg/codenotch`.
+O proprietário autorizou publicar as evoluções Windows em um único commit
+na branch da PR existente. Isso não autoriza merge nem release estável.
 
-Alterações são propostas em PR, passam pelos checks **Build and test**,
-**Build and test (Linux)** e **NSIS installer**, e dependem do aval do proprietário
-antes do merge. Publicar uma branch ou validar o CI não autoriza merge nem release.
+Somente a conta proprietária deve ter escrita/admin. A publicidade permite
+leitura, não escrita. Alterações seguem PR e os checks reais de Windows,
+Linux e instalador, com aval explícito antes do merge ou release.
 
-Na conta atual, o GitHub exige Pro para aplicar regras de proteção em repositórios
-privados. Portanto, este processo é uma disciplina de manutenção, sem bloqueio
-de branch aplicado pelo servidor. O proprietário aceitou o acesso privado como
-controle suficiente contra alterações de terceiros. Não adicione colaboradores
-de escrita sem revisar essa decisão.
+A política global está em `~/.agents/regras/contexto-git.md`; seu helper
+`~/.agents/scripts/github/repositorio.py --action audit --repo dono/nome`
+confere acesso, visibilidade, rulesets e Actions sem alterações. Ao associar
+um destino novo, aplicar a política autorizada e verificar as capacidades do
+plano. Repositórios existentes conservam sua visibilidade.
 
-O GitHub não permite aprovar uma PR da própria conta. O aval do proprietário
-para uma PR de sua autoria é registrado explicitamente antes do merge; não é
-apresentado como uma aprovação nativa do GitHub.
+A conta proprietária não aprova nativamente uma PR da própria autoria. O
+controle vem da escrita exclusiva e das regras da branch principal; o aval
+humano antes do merge continua necessário.
 
-O download de artifacts e releases exige login com acesso ao repositório. O
-updater anônimo não recebe credenciais pessoais nem pode consultar essas releases.
-Um mecanismo de atualização autenticada precisa de uma decisão própria.
+Os endereços do updater e download devem corresponder ao fork de distribuição.
+Se ele for privado, os downloads exigem autenticação. Publicar uma branch ou
+passar no CI não autoriza release.
